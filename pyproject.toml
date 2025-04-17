@@ -21,6 +21,7 @@ dev = [
 
 [project.scripts]
 stargazers = "stargazers.cli:main"
+forkers = "stargazers.cli:main_forkers"
 
 [tool.ruff]
 target-version = "py312"

@@ -6,7 +6,13 @@ from unittest.mock import patch
 
 import pytest
 
-from stargazers.cli import fetch_stargazers, fetch_user_metadata, summarize_and_save
+from stargazers.cli import (
+    fetch_forkers,
+    fetch_stargazers,
+    fetch_user_metadata,
+    main_forkers,
+    summarize_and_save,
+)
 
 
 # Use httpx_mock for mocking HTTP requests
@@ -119,4 +125,100 @@ def test_summarize_and_save():
     with patch("stargazers.cli.pd.DataFrame.to_csv") as mock_to_csv:
         summarize_and_save(data, repo)
         # Check that to_csv was called
+        assert mock_to_csv.called
+
+
+def test_fetch_forkers(httpx_mock):
+    repo = "test_owner/test_repo"
+    # Mock two pages of forkers
+    forkers_page1 = [
+        {"owner": {"login": "forker1", "id": 101}, "created_at": "2023-01-01T00:00:00Z"},
+        {"owner": {"login": "forker2", "id": 102}, "created_at": "2023-01-02T00:00:00Z"},
+    ]
+    forkers_page2 = []
+    base_url = f"https://api.github.com/repos/{repo}/forks"
+    # First page
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page=100&page=1",
+        method="GET",
+        json=forkers_page1,
+        status_code=200,
+    )
+    # Second page (empty)
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page=100&page=2",
+        method="GET",
+        json=forkers_page2,
+        status_code=200,
+    )
+    users = fetch_forkers(repo)
+    assert len(users) == 2
+    assert users[0]["login"] == "forker1"
+    assert users[1]["login"] == "forker2"
+    assert users[0]["forked_at"] == "2023-01-01T00:00:00Z"
+
+
+def test_main_forkers(monkeypatch, httpx_mock):
+    # Patch sys.argv
+    import sys
+
+    repo = "test_owner/test_repo"
+    monkeypatch.setattr(sys, "argv", ["forkers", repo])
+    # Mock forkers API
+    forkers_page1 = [
+        {"owner": {"login": "forker1", "id": 101}, "created_at": "2023-01-01T00:00:00Z"},
+        {"owner": {"login": "forker2", "id": 102}, "created_at": "2023-01-02T00:00:00Z"},
+    ]
+    forkers_page2 = []
+    base_url = f"https://api.github.com/repos/{repo}/forks"
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page=100&page=1",
+        method="GET",
+        json=forkers_page1,
+        status_code=200,
+    )
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page=100&page=2",
+        method="GET",
+        json=forkers_page2,
+        status_code=200,
+    )
+    # Mock user metadata API
+    user1_data = {
+        "login": "forker1",
+        "name": "Forker One",
+        "company": "TestCo",
+        "location": "Earth",
+        "email": "forker1@example.com",
+        "bio": "Bio1",
+        "followers": 10,
+        "public_repos": 5,
+    }
+    user2_data = {
+        "login": "forker2",
+        "name": "Forker Two",
+        "company": None,
+        "location": "Mars",
+        "email": None,
+        "bio": None,
+        "followers": 20,
+        "public_repos": 8,
+    }
+    httpx_mock.add_response(
+        url="https://api.github.com/users/forker1",
+        method="GET",
+        json=user1_data,
+        status_code=200,
+    )
+    httpx_mock.add_response(
+        url="https://api.github.com/users/forker2",
+        method="GET",
+        json=user2_data,
+        status_code=200,
+    )
+    # Patch to_csv to avoid file I/O
+    from unittest.mock import patch
+
+    with patch("stargazers.cli.pd.DataFrame.to_csv") as mock_to_csv:
+        main_forkers()
         assert mock_to_csv.called

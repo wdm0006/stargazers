@@ -4,11 +4,11 @@ import time
 
 import httpx
 import pandas as pd
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import track
 from rich.traceback import install
-from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -35,7 +35,10 @@ def fetch_stargazers(repo: str) -> list:
         )
         console.log(f"Response status: {response.status_code}")
         if response.status_code == 404:
-            console.log(f"[red]Repository '{repo}' not found. Please check the owner/repo name and try again.[/]")
+            console.log(
+                f"[red]Repository '{repo}' not found. "
+                f"Please check the owner/repo name and try again.[/]"
+            )
             raise SystemExit(1)
         if response.status_code != 200:
             console.log(
@@ -106,11 +109,12 @@ def fetch_user_metadata(stargazers: list) -> list:
     return data
 
 
-def summarize_and_save(data: list, repo: str) -> None:
+def summarize_and_save(data: list, repo: str, output_file: str | None = None) -> None:
     df = pd.DataFrame(data)
     if "starred_at" in df.columns:
         df = df.sort_values("starred_at", ascending=False)
-    output_file = f"{repo.replace('/', '_')}_stargazers.csv"
+    if output_file is None:
+        output_file = f"{repo.replace('/', '_')}_stargazers.csv"
     console.log(f"Saving DataFrame with {len(df)} rows to {output_file}")
     df.to_csv(output_file, index=False)
     console.print(f"[green]\nSaved {len(df)} users to {output_file}[/]")
@@ -124,13 +128,19 @@ def summarize_and_save(data: list, repo: str) -> None:
 
 def print_help():
     help_text = """
-GitHub Stargazer Analyzer
+GitHub Stargazer & Forker Analyzer
 
 Usage:
-  stargazers <owner/repo>
+  stargazers <owner/repo> [<owner/repo> ...]    Analyze stargazers for one or more repositories
+  forkers <owner/repo> [<owner/repo> ...]       Analyze forkers for one or more repositories
 
 Arguments:
-  <owner/repo>   GitHub repository in the format 'owner/repo'
+  <owner/repo>   GitHub repository in the format 'owner/repo'. You can specify multiple repos.
+
+Output:
+  - For a single repo, results are written to <repo>_stargazers.csv or <repo>_forkers.csv.
+  - For multiple repos, results are combined and written to all_stargazers.csv or all_forkers.csv,
+    with a 'repo' column indicating the source.
 
 Environment:
   GITHUB_TOKEN   Personal access token for authenticated GitHub API requests
@@ -139,7 +149,7 @@ Environment:
         Panel(
             help_text.strip(),
             title="Help",
-            subtitle="GitHub Stargazers",
+            subtitle="GitHub Stargazers & Forkers",
             expand=False,
         )
     )
@@ -147,20 +157,85 @@ Environment:
 
 def main():
     token = os.getenv("GITHUB_TOKEN")
-    if token:
-        redacted = token[:4] + "..." + token[-4:]
-    else:
-        redacted = None
+    redacted = token[:4] + "..." + token[-4:] if token else None
     console.log(f"DEBUG: GITHUB_TOKEN={redacted}")
     console.log(f"Script started with arguments: {sys.argv}")
-    if len(sys.argv) != 2 or sys.argv[1] in {"-h", "--help"}:
+    if len(sys.argv) < 2 or any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
         print_help()
         sys.exit(0)
-    repo = sys.argv[1]
-    stargazers = fetch_stargazers(repo)
-    console.log(
-        f"User logins and starred_at to fetch metadata for: "
-        f"{[{'login': s['login'], 'starred_at': s['starred_at']} for s in stargazers]}"
-    )
-    metadata = fetch_user_metadata(stargazers)
-    summarize_and_save(metadata, repo)
+    repos = sys.argv[1:]
+    all_metadata = []
+    for repo in repos:
+        stargazers = fetch_stargazers(repo)
+        console.log(
+            f"User logins and starred_at to fetch metadata for: "
+            f"{[{'login': s['login'], 'starred_at': s['starred_at']} for s in stargazers]}"
+        )
+        metadata = fetch_user_metadata(stargazers)
+        for m in metadata:
+            m["repo"] = repo
+        all_metadata.extend(metadata)
+    if len(repos) == 1:
+        summarize_and_save(all_metadata, repos[0])
+    else:
+        summarize_and_save(all_metadata, "all", output_file="all_stargazers.csv")
+
+
+def fetch_forkers(repo: str) -> list:
+    console.log(f"[bold blue]Fetching forkers for:[/] {repo}")
+    url = f"{GITHUB_API}/repos/{repo}/forks"
+    params = {"per_page": 100, "page": 1}
+    users = []
+    while True:
+        console.log(f"Requesting: {url} with params {params}")
+        response = httpx.get(
+            url,
+            headers=HEADERS,
+            params=params,
+        )
+        console.log(f"Response status: {response.status_code}")
+        if response.status_code == 404:
+            console.log(
+                f"[red]Repository '{repo}' not found. "
+                f"Please check the owner/repo name and try again.[/]"
+            )
+            raise SystemExit(1)
+        if response.status_code != 200:
+            console.log(f"[red]Error fetching forkers: {response.status_code} - {response.text}[/]")
+            sys.exit(1)
+        batch = response.json()
+        console.log(f"Fetched {len(batch)} forkers in this batch.")
+        if not batch:
+            break
+        users.extend([{**f["owner"], "forked_at": f["created_at"]} for f in batch])
+        params["page"] += 1
+        time.sleep(0.5)
+    console.log(f"Total forkers fetched: {len(users)}")
+    return users
+
+
+def main_forkers():
+    token = os.getenv("GITHUB_TOKEN")
+    redacted = token[:4] + "..." + token[-4:] if token else None
+    console.log(f"DEBUG: GITHUB_TOKEN={redacted}")
+    console.log(f"Script started with arguments: {sys.argv}")
+    if len(sys.argv) < 2 or any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+        print_help()
+        sys.exit(0)
+    repos = sys.argv[1:]
+    all_metadata = []
+    for repo in repos:
+        forkers = fetch_forkers(repo)
+        console.log(
+            f"User logins and forked_at to fetch metadata for: "
+            f"{[{'login': f['login'], 'forked_at': f['forked_at']} for f in forkers]}"
+        )
+        metadata = fetch_user_metadata(
+            [{"login": f["login"], "starred_at": f["forked_at"], "repo": repo} for f in forkers]
+        )
+        all_metadata.extend(metadata)
+    if len(repos) == 1:
+        output_file = f"{repos[0].replace('/', '_')}_forkers.csv"
+        summarize_and_save(all_metadata, repos[0], output_file=output_file)
+    else:
+        summarize_and_save(all_metadata, "all", output_file="all_forkers.csv")
