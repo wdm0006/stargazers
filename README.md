@@ -136,3 +136,7 @@ Pull requests are welcome! For major changes, please open an issue first to disc
 
 ## License
 [MIT](LICENSE)
+
+## Posts
+
+- [Introducing the Stargazers Tool](https://mcginniscommawill.com/posts/2025-04-16-introducing-stargazers-tool/) - A blog post introducing the tool and its use cases
