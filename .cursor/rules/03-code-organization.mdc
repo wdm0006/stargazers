@@ -1,0 +1,32 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Code Organization
+
+## Project Structure
+The main code is organized in the `stargazers` package:
+
+- `stargazers/cli.py` - Command-line interface implementation
+
+## Key Components
+1. CLI Interface
+   - Uses Click for command-line parsing
+   - Three main commands: repos, forkers, account-trend
+   - Handles argument validation and processing
+
+2. GitHub Integration
+   - REST API client implementation
+   - Rate limit handling and retries
+   - Authentication management
+
+3. Data Processing
+   - User metadata extraction
+   - Star/fork data aggregation
+   - CSV export functionality
+
+4. Visualization
+   - Terminal-based charts using plotext
+   - Progress bars and status updates
+   - Summary statistics display

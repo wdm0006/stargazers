@@ -2,6 +2,8 @@
 
 A modern CLI tool to fetch, analyze, and summarize the stargazers or forkers of any public GitHub repository.
 
+![account-trend](./img/trend.png)
+
 ## What is this?
 
 **Stargazers** helps you understand who is starring or forking your GitHub project. It fetches all stargazers or forkers for a given repository (or multiple repositories), retrieves public metadata for each user, and outputs a CSV file with rich summary statistics. This is useful for open source maintainers, community managers, or anyone curious about their project's audience.
@@ -37,30 +39,62 @@ pip install git+https://github.com/wdm0006/stargazers.git
 
 ## Usage
 
-After installation, you can run the CLI from anywhere in your shell:
+After installation, you can run the CLI from anywhere in your shell using the `stargazers` command followed by a subcommand:
 
-### Stargazers
+**Subcommands:**
 
+*   `repos`: Fetches and analyzes stargazers for one or more repositories.
+*   `forkers`: Fetches and analyzes forkers for one or more repositories.
+*   `account-trend`: Analyzes star trends over time for all of a user's owned repositories.
+
+### Analyzing Repository Stargazers
+
+To analyze stargazers for specific repositories:
 ```sh
-stargazers <owner/repo> [<owner/repo> ...]
+stargazers repos <owner/repo> [<owner/repo> ...]
+```
+Example:
+```sh
+stargazers repos wdm0006/pygeohash wdm0006/elote
 ```
 
-### Forkers
+### Analyzing Repository Forkers
 
+To analyze forkers for specific repositories:
 ```sh
-forkers <owner/repo> [<owner/repo> ...]
+stargazers forkers <owner/repo> [<owner/repo> ...]
+```
+Example:
+```sh
+stargazers forkers wdm0006/pygeohash wdm0006/elote
 ```
 
-You can specify one or more repositories. For example:
+### Analyzing User Account Star Trends
 
+To analyze the overall star trend for a user's account, optionally including other specific repositories, excluding some, and displaying a terminal chart:
 ```sh
-stargazers wdm0006/pygeohash wdm0006/elote
-forkers wdm0006/pygeohash wdm0006/elote
+stargazers account-trend <username> [--include-repo <owner/repo_to_include>] [--exclude-repo <owner/repo_to_exclude>] [--line-chart]
+```
+You can specify multiple `--include-repo` and `--exclude-repo` options if needed. The `--line-chart` flag will print a plot of cumulative stars to your terminal.
+
+Example:
+```sh
+stargazers account-trend wdm0006
+stargazers account-trend someotheruser --exclude-repo someotheruser/old-project
+stargazers account-trend wdm0006 --include-repo scikit-learn-contrib/category_encoders --exclude-repo wdm0006/some-old-repo
+stargazers account-trend wdm0006 --line-chart
+stargazers account-trend wdm0006 --include-repo scikit-learn-contrib/category_encoders --line-chart
 ```
 
 ### Output files
-- For a single repo, results are written to `<repo>_stargazers.csv` or `<repo>_forkers.csv`.
-- For multiple repos, results are combined and written to `all_stargazers.csv` or `all_forkers.csv`, with a `repo` column indicating the source.
+- For the `repos` subcommand with a single repo: `<owner>_<repo>_stargazers.csv`.
+- For the `repos` subcommand with multiple repos: `all_repos_stargazers.csv`.
+- For the `forkers` subcommand with a single repo: `<owner>_<repo>_forkers.csv`.
+- For the `forkers` subcommand with multiple repos: `all_repos_forkers.csv`.
+- For the `account-trend` subcommand: `<username>_account_stars_by_day.csv`.
+  This file will contain columns: `star_date`, `new_stars_on_day`, `cumulative_stars_up_to_day`.
+
+For `repos` and `forkers`, the CSVs will have a `repo` column indicating the source repository when multiple repositories are processed.
 
 ### Example Output
 

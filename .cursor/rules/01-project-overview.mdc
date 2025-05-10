@@ -1,0 +1,26 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Project Overview
+
+Stargazers is a modern CLI tool for analyzing GitHub repository stars and forks. The project follows a clean, modular structure:
+
+- [README.md](mdc:README.md) - Main documentation and usage guide
+- [pyproject.toml](mdc:pyproject.toml) - Package configuration and dependencies
+- [stargazers/](mdc:stargazers) - Main package directory containing core functionality
+- [Makefile](mdc:Makefile) - makefile for common commands
+
+## Key Features
+- Fetch and analyze stargazers for GitHub repositories
+- Analyze repository forkers
+- Generate account-wide star trend analysis
+- Export data to CSV files
+- Terminal-based data visualization
+
+## Main Commands
+The CLI supports three main subcommands:
+- `repos` - Analyze repository stargazers
+- `forkers` - Analyze repository forkers  
+- `account-trend` - Analyze star trends across all repos

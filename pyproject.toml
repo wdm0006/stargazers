@@ -7,7 +7,9 @@ dependencies = [
     "httpx",
     "pandas",
     "rich",
-    "python-dotenv"
+    "python-dotenv",
+    "click",
+    "plotext"
 ]
 requires-python = ">=3.12"
 
@@ -20,19 +22,30 @@ dev = [
 ]
 
 [project.scripts]
-stargazers = "stargazers.cli:main"
-forkers = "stargazers.cli:main_forkers"
+stargazers = "stargazers.cli:cli"
 
 [tool.ruff]
-target-version = "py312"
-line-length = 100
-extend-exclude = [".venv", "build", "dist"]
+target-version = "py310"
+line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "T20", "SIM", "ARG", "DTZ", "PIE", "Q", "RET", "RUF"]
+select = ["E", "F", "B", "S"]
 ignore = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["stargazers"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # Ignore unused imports in __init__.py files
+"tests/**/*.py" = ["B011", "S101"]  # Ignore assert warnings in test files
 
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
-line-ending = "auto" 
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+markers = [
+    "httpx: Mark the test as using httpx.",
+] 

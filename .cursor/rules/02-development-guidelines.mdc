@@ -1,0 +1,31 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Development Guidelines
+
+## Installation
+The project can be installed in development mode using:
+```sh
+make install
+```
+
+
+## Development Commands
+- `make test` - Run test suite
+- `make lint` - Run linting and code formatting
+- `make install` - Install all development dependencies
+- `make demo` - Run a demonstration of the tool
+
+## GitHub API Usage
+- Uses GitHub's REST API for data fetching
+- Supports both authenticated and unauthenticated requests
+- Rate limits: 
+  - Unauthenticated: 60 requests/hour
+  - Authenticated: 5,000 requests/hour (requires GITHUB_TOKEN)
+
+## Output Files
+- Single repo analysis: `<owner>_<repo>_stargazers.csv` or `<owner>_<repo>_forkers.csv`
+- Multi-repo analysis: `all_repos_stargazers.csv` or `all_repos_forkers.csv`
+- Account trend analysis: `<username>_account_stars_by_day.csv`
