@@ -48,4 +48,8 @@ line-ending = "auto"
 [tool.pytest.ini_options]
 markers = [
     "httpx: Mark the test as using httpx.",
-] 
+]
+
+[tool.setuptools.packages.find]
+include = ["stargazers*"]
+exclude = ["img*"] 
