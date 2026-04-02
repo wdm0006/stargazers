@@ -15,6 +15,9 @@ from stargazers.cli import (
     cli,
     fetch_forkers,
     fetch_stargazers,
+    fetch_traffic_clones,
+    fetch_traffic_referrers,
+    fetch_traffic_views,
     fetch_user_metadata,
     summarize_and_save,
 )
@@ -642,3 +645,206 @@ def test_plot_command_invalid_csv(runner, tmp_path, monkeypatch):
     result = runner.invoke(cli, ["plot", "--file", str(test_csv), "--type", "account-trend"])
     assert result.exit_code == 1
     assert "CSV file must contain columns" in result.output
+
+
+# --- Traffic command tests ---
+
+
+def mock_traffic_views_api(httpx_mock, repo_full_name, views_data):
+    """Helper to mock the /repos/{repo}/traffic/views endpoint."""
+    url = f"{BASE_API_URL}/repos/{repo_full_name}/traffic/views"
+    httpx_mock.add_response(url=url, method="GET", json=views_data, status_code=200)
+
+
+def mock_traffic_clones_api(httpx_mock, repo_full_name, clones_data):
+    """Helper to mock the /repos/{repo}/traffic/clones endpoint."""
+    url = f"{BASE_API_URL}/repos/{repo_full_name}/traffic/clones"
+    httpx_mock.add_response(url=url, method="GET", json=clones_data, status_code=200)
+
+
+def mock_traffic_referrers_api(httpx_mock, repo_full_name, referrers_data):
+    """Helper to mock the /repos/{repo}/traffic/popular/referrers endpoint."""
+    url = f"{BASE_API_URL}/repos/{repo_full_name}/traffic/popular/referrers"
+    httpx_mock.add_response(url=url, method="GET", json=referrers_data, status_code=200)
+
+
+def test_fetch_traffic_views(httpx_mock):
+    repo = "testowner/testrepo"
+    views_response = {
+        "count": 100,
+        "uniques": 50,
+        "views": [
+            {"timestamp": "2023-01-01T00:00:00Z", "count": 60, "uniques": 30},
+            {"timestamp": "2023-01-02T00:00:00Z", "count": 40, "uniques": 20},
+        ],
+    }
+    mock_traffic_views_api(httpx_mock, repo, views_response)
+    result = fetch_traffic_views(repo)
+    assert result is not None
+    assert result["count"] == 100
+    assert result["uniques"] == 50
+    assert len(result["views"]) == 2
+
+
+def test_fetch_traffic_views_no_access(httpx_mock):
+    repo = "testowner/private_repo"
+    url = f"{BASE_API_URL}/repos/{repo}/traffic/views"
+    httpx_mock.add_response(url=url, method="GET", json={"message": "Forbidden"}, status_code=403)
+    result = fetch_traffic_views(repo)
+    assert result is None
+
+
+def test_fetch_traffic_clones(httpx_mock):
+    repo = "testowner/testrepo"
+    clones_response = {
+        "count": 25,
+        "uniques": 10,
+        "clones": [
+            {"timestamp": "2023-01-01T00:00:00Z", "count": 15, "uniques": 6},
+            {"timestamp": "2023-01-02T00:00:00Z", "count": 10, "uniques": 4},
+        ],
+    }
+    mock_traffic_clones_api(httpx_mock, repo, clones_response)
+    result = fetch_traffic_clones(repo)
+    assert result is not None
+    assert result["count"] == 25
+    assert result["uniques"] == 10
+
+
+def test_fetch_traffic_referrers(httpx_mock):
+    repo = "testowner/testrepo"
+    referrers_response = [
+        {"referrer": "github.com", "count": 80, "uniques": 40},
+        {"referrer": "google.com", "count": 20, "uniques": 10},
+    ]
+    mock_traffic_referrers_api(httpx_mock, repo, referrers_response)
+    result = fetch_traffic_referrers(repo)
+    assert result is not None
+    assert len(result) == 2
+    assert result[0]["referrer"] == "github.com"
+
+
+def test_traffic_command(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+
+    mock_user_repos_api(
+        httpx_mock,
+        username,
+        [
+            {"full_name": "testuser/repo1", "owner": {"login": username}},
+            {"full_name": "testuser/repo2", "owner": {"login": username}},
+        ],
+    )
+
+    # Mock traffic endpoints for repo1
+    mock_traffic_views_api(httpx_mock, "testuser/repo1", {"count": 100, "uniques": 50, "views": []})
+    mock_traffic_clones_api(httpx_mock, "testuser/repo1", {"count": 20, "uniques": 10, "clones": []})
+    mock_traffic_referrers_api(
+        httpx_mock,
+        "testuser/repo1",
+        [
+            {"referrer": "github.com", "count": 60, "uniques": 30},
+            {"referrer": "google.com", "count": 40, "uniques": 20},
+        ],
+    )
+
+    # Mock traffic endpoints for repo2
+    mock_traffic_views_api(httpx_mock, "testuser/repo2", {"count": 50, "uniques": 25, "views": []})
+    mock_traffic_clones_api(httpx_mock, "testuser/repo2", {"count": 5, "uniques": 3, "clones": []})
+    mock_traffic_referrers_api(
+        httpx_mock,
+        "testuser/repo2",
+        [
+            {"referrer": "github.com", "count": 30, "uniques": 15},
+            {"referrer": "reddit.com", "count": 20, "uniques": 10},
+        ],
+    )
+
+    result = runner.invoke(cli, ["traffic", username], catch_exceptions=False)
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+
+    # Check output files
+    traffic_file = tmp_path / f"{username}_traffic.csv"
+    assert traffic_file.exists()
+    data = read_csv_output(traffic_file)
+    assert len(data) == 2
+    # repo1 has more views, should be first
+    assert data[0]["repo"] == "testuser/repo1"
+    assert data[0]["views"] == "100"
+    assert data[1]["repo"] == "testuser/repo2"
+    assert data[1]["views"] == "50"
+
+    referrers_file = tmp_path / f"{username}_referrers.csv"
+    assert referrers_file.exists()
+    ref_data = read_csv_output(referrers_file)
+    assert len(ref_data) == 3
+    # github.com should be first (60+30=90)
+    assert ref_data[0]["referrer"] == "github.com"
+    assert ref_data[0]["count"] == "90"
+    assert ref_data[0]["uniques"] == "45"
+
+
+def test_traffic_command_with_exclude(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+
+    mock_user_repos_api(
+        httpx_mock,
+        username,
+        [
+            {"full_name": "testuser/repo1", "owner": {"login": username}},
+            {"full_name": "testuser/repo2", "owner": {"login": username}},
+        ],
+    )
+
+    # Only mock repo1 traffic (repo2 is excluded)
+    mock_traffic_views_api(httpx_mock, "testuser/repo1", {"count": 100, "uniques": 50, "views": []})
+    mock_traffic_clones_api(httpx_mock, "testuser/repo1", {"count": 20, "uniques": 10, "clones": []})
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo1", [])
+
+    result = runner.invoke(
+        cli, ["traffic", username, "--exclude-repo", "testuser/repo2"], catch_exceptions=False
+    )
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+
+    traffic_file = tmp_path / f"{username}_traffic.csv"
+    assert traffic_file.exists()
+    data = read_csv_output(traffic_file)
+    assert len(data) == 1
+    assert data[0]["repo"] == "testuser/repo1"
+
+
+def test_traffic_command_skips_no_access(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+
+    mock_user_repos_api(
+        httpx_mock,
+        username,
+        [
+            {"full_name": "testuser/repo1", "owner": {"login": username}},
+            {"full_name": "testuser/noaccess", "owner": {"login": username}},
+        ],
+    )
+
+    # repo1 works fine
+    mock_traffic_views_api(httpx_mock, "testuser/repo1", {"count": 50, "uniques": 25, "views": []})
+    mock_traffic_clones_api(httpx_mock, "testuser/repo1", {"count": 10, "uniques": 5, "clones": []})
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo1", [])
+
+    # noaccess returns 403
+    url_views = f"{BASE_API_URL}/repos/testuser/noaccess/traffic/views"
+    httpx_mock.add_response(url=url_views, method="GET", json={"message": "Forbidden"}, status_code=403)
+
+    result = runner.invoke(cli, ["traffic", username], catch_exceptions=False)
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+
+    traffic_file = tmp_path / f"{username}_traffic.csv"
+    assert traffic_file.exists()
+    data = read_csv_output(traffic_file)
+    assert len(data) == 1
+    assert data[0]["repo"] == "testuser/repo1"

@@ -161,6 +161,81 @@ def fetch_forkers(repo: str) -> list:
     return fork_details
 
 
+def fetch_traffic_views(repo: str) -> dict | None:
+    """Fetches traffic view data for a repository (last 14 days). Requires push access."""
+    url = f"{GITHUB_API}/repos/{repo}/traffic/views"
+    try:
+        response = httpx.get(url, headers={**HEADERS, **DEFAULT_HEADERS})
+    except httpx.RequestError as e:
+        console.log(f"[red]Request failed fetching views for {repo}: {e}[/]")
+        return None
+
+    if response.status_code == 403:
+        console.log(f"[yellow]No push access to {repo}, skipping traffic data.[/]")
+        return None
+
+    error_action = _handle_api_error(response, f"fetching traffic views for {repo}")
+    if error_action == "retry":
+        try:
+            response = httpx.get(url, headers={**HEADERS, **DEFAULT_HEADERS})
+        except httpx.RequestError:
+            return None
+        if response.status_code != 200:
+            return None
+
+    return response.json()
+
+
+def fetch_traffic_clones(repo: str) -> dict | None:
+    """Fetches traffic clone data for a repository (last 14 days). Requires push access."""
+    url = f"{GITHUB_API}/repos/{repo}/traffic/clones"
+    try:
+        response = httpx.get(url, headers={**HEADERS, **DEFAULT_HEADERS})
+    except httpx.RequestError as e:
+        console.log(f"[red]Request failed fetching clones for {repo}: {e}[/]")
+        return None
+
+    if response.status_code == 403:
+        console.log(f"[yellow]No push access to {repo}, skipping clone data.[/]")
+        return None
+
+    error_action = _handle_api_error(response, f"fetching traffic clones for {repo}")
+    if error_action == "retry":
+        try:
+            response = httpx.get(url, headers={**HEADERS, **DEFAULT_HEADERS})
+        except httpx.RequestError:
+            return None
+        if response.status_code != 200:
+            return None
+
+    return response.json()
+
+
+def fetch_traffic_referrers(repo: str) -> list | None:
+    """Fetches top referral sources for a repository (last 14 days). Requires push access."""
+    url = f"{GITHUB_API}/repos/{repo}/traffic/popular/referrers"
+    try:
+        response = httpx.get(url, headers={**HEADERS, **DEFAULT_HEADERS})
+    except httpx.RequestError as e:
+        console.log(f"[red]Request failed fetching referrers for {repo}: {e}[/]")
+        return None
+
+    if response.status_code == 403:
+        console.log(f"[yellow]No push access to {repo}, skipping referrer data.[/]")
+        return None
+
+    error_action = _handle_api_error(response, f"fetching traffic referrers for {repo}")
+    if error_action == "retry":
+        try:
+            response = httpx.get(url, headers={**HEADERS, **DEFAULT_HEADERS})
+        except httpx.RequestError:
+            return None
+        if response.status_code != 200:
+            return None
+
+    return response.json()
+
+
 def fetch_user_metadata(users_info: list, timestamp_key: str = "starred_at") -> list:
     """
     Fetches detailed metadata for a list of users.
@@ -528,6 +603,142 @@ def account_trend_command(ctx, username: str, exclude_repos: tuple[str], include
 
     output_base_name = username
     summarize_and_save(final_df.to_dict("records"), output_base_name, "account_stars_by_day", timestamp_key="star_date")
+
+
+@cli.command("traffic")
+@click.argument("username")
+@click.option(
+    "--exclude-repo",
+    "exclude_repos",
+    multiple=True,
+    help="Repositories to exclude (e.g., owner/repo). Can be used multiple times.",
+)
+@click.option(
+    "--include-repo",
+    "include_repos",
+    multiple=True,
+    help="Additional repositories to include (format: owner/repo). Can be used multiple times.",
+)
+@click.pass_context
+def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos: tuple[str]):
+    """
+    Aggregates GitHub traffic data (views, clones, referrers) across all repositories
+    owned by USERNAME. Shows totals, top repos by views, and aggregated referrer data.
+
+    Note: Requires a GITHUB_TOKEN with push access to the repos. Traffic data covers the last 14 days only.
+    """
+    console.log(
+        "Command: 'traffic', "
+        f"User: {username}, "
+        f"Include Repos: {include_repos}, "
+        f"Exclude Repos: {exclude_repos}"
+    )
+
+    user_owned_repos = fetch_user_repos(username)
+    console.log(f"Found {len(user_owned_repos)} repositories owned by {username}.")
+
+    candidate_repos = list(user_owned_repos)
+    if include_repos:
+        console.log(f"Additionally including {len(include_repos)} repositories: {include_repos}")
+        candidate_repos.extend(list(include_repos))
+
+    unique_candidate_repos = sorted(list(set(candidate_repos)))
+
+    if exclude_repos:
+        console.log(f"Excluding: {exclude_repos}")
+        repos_to_process = [repo for repo in unique_candidate_repos if repo not in exclude_repos]
+    else:
+        repos_to_process = unique_candidate_repos
+
+    if not repos_to_process:
+        console.log(f"[yellow]No repositories to process for user {username}.[/]")
+        return
+
+    # Collect traffic data across all repos
+    repo_views = []
+    repo_clones = []
+    all_referrers = {}  # referrer -> {count, uniques}
+    skipped = 0
+
+    for repo_name in track(repos_to_process, description=f"Fetching traffic for {username}'s repos"):
+        views = fetch_traffic_views(repo_name)
+        if views is None:
+            skipped += 1
+            continue
+
+        clones = fetch_traffic_clones(repo_name)
+        referrers = fetch_traffic_referrers(repo_name)
+        time.sleep(0.2)
+
+        repo_views.append({
+            "repo": repo_name,
+            "views": views.get("count", 0),
+            "unique_views": views.get("uniques", 0),
+        })
+        repo_clones.append({
+            "repo": repo_name,
+            "clones": clones.get("count", 0) if clones else 0,
+            "unique_clones": clones.get("uniques", 0) if clones else 0,
+        })
+
+        if referrers:
+            for ref in referrers:
+                name = ref["referrer"]
+                if name not in all_referrers:
+                    all_referrers[name] = {"count": 0, "uniques": 0}
+                all_referrers[name]["count"] += ref["count"]
+                all_referrers[name]["uniques"] += ref["uniques"]
+
+    if not repo_views:
+        console.log("[yellow]No traffic data retrieved. Ensure your token has push access to the repos.[/]")
+        return
+
+    # Build DataFrames
+    views_df = pd.DataFrame(repo_views).sort_values("views", ascending=False)
+    clones_df = pd.DataFrame(repo_clones).sort_values("clones", ascending=False)
+
+    total_views = views_df["views"].sum()
+    total_unique_views = views_df["unique_views"].sum()
+    total_clones = clones_df["clones"].sum()
+    total_unique_clones = clones_df["unique_clones"].sum()
+
+    # Print summary
+    console.print("\n[bold]Traffic Summary (last 14 days)[/bold]")
+    console.print(f"Repos analyzed: {len(repo_views)} (skipped {skipped} due to access)")
+    console.print(f"\n[bold]Total Views:[/bold] {total_views:,} ({total_unique_views:,} unique)")
+    console.print(f"[bold]Total Clones:[/bold] {total_clones:,} ({total_unique_clones:,} unique)")
+
+    # Top repos by views
+    top_n = min(10, len(views_df))
+    console.print(f"\n[bold]Top {top_n} Repos by Views:[/bold]")
+    for _, row in views_df.head(top_n).iterrows():
+        clone_row = clones_df[clones_df["repo"] == row["repo"]].iloc[0]
+        console.print(
+            f"  {row['repo']}: {row['views']:,} views ({row['unique_views']:,} unique), "
+            f"{clone_row['clones']:,} clones ({clone_row['unique_clones']:,} unique)"
+        )
+
+    # Aggregated referrers
+    if all_referrers:
+        ref_df = pd.DataFrame([
+            {"referrer": k, "count": v["count"], "uniques": v["uniques"]}
+            for k, v in all_referrers.items()
+        ]).sort_values("count", ascending=False)
+
+        console.print(f"\n[bold]Top Referrers (aggregated across all repos):[/bold]")
+        for _, row in ref_df.head(15).iterrows():
+            console.print(f"  {row['referrer']}: {row['count']:,} ({row['uniques']:,} unique)")
+
+    # Save to CSV
+    combined_df = views_df.merge(clones_df, on="repo")
+    output_file = f"{username}_traffic.csv"
+    combined_df.to_csv(output_file, index=False)
+    console.print(f"\n[green]Saved per-repo traffic data to {output_file}[/]")
+
+    if all_referrers:
+        ref_output = f"{username}_referrers.csv"
+        ref_df.to_csv(ref_output, index=False)
+        console.print(f"[green]Saved aggregated referrer data to {ref_output}[/]")
 
 
 @cli.command("plot")
