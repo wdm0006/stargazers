@@ -29,14 +29,15 @@ def _handle_api_error(response: httpx.Response, context_message: str):
         console.log(f"[red]{context_message} not found. Please check the input and try again.[/]")
         raise SystemExit(1)
     if response.status_code == 403 and "rate limit" in response.text.lower():
+        console.log(f"[yellow]Rate limit hit. Headers: {response.headers}[/]")
         # Basic wait, more sophisticated backoff might be needed for heavy use
         wait_time = 60
         reset_time = response.headers.get("X-RateLimit-Reset")
         if reset_time:
             wait_time = max(1, int(reset_time) - int(time.time()))
-            console.log(f"[yellow]Rate limit hit. Headers: {response.headers}. Rate limit reset time: {reset_time}. Waiting for {wait_time} seconds.[/]")
+            console.log(f"[yellow]Rate limit reset time: {reset_time}. Waiting for {wait_time} seconds.[/]")
         else:
-            console.log(f"[yellow]Rate limit hit. Headers: {response.headers}. No X-RateLimit-Reset header. Waiting for {wait_time} seconds as a fallback.[/]")
+            console.log(f"[yellow]No X-RateLimit-Reset header. Waiting for {wait_time} seconds as a fallback.[/]")
 
         with console.status(f"[yellow]Rate limit hit. Waiting for {wait_time}s...[/]", spinner="dots"):
             time.sleep(wait_time)
