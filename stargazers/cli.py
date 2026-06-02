@@ -725,7 +725,7 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
             for k, v in all_referrers.items()
         ]).sort_values("count", ascending=False)
 
-        console.print(f"\n[bold]Top Referrers (aggregated across all repos):[/bold]")
+        console.print("\n[bold]Top Referrers (aggregated across all repos):[/bold]")
         for _, row in ref_df.head(15).iterrows():
             console.print(f"  {row['referrer']}: {row['count']:,} ({row['uniques']:,} unique)")
 
