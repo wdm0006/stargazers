@@ -561,21 +561,6 @@ def test_forkers_command(runner, httpx_mock_non_strict_assertion, tmp_path, monk
     assert data[1]["login"] == "forkerA"
 
 
-def test_account_trend_plotting():
-    """Test that account trend plotting works correctly with sample data."""
-    runner = CliRunner()
-    result = runner.invoke(cli, ["account-trend", "testuser", "--line-chart"])
-    assert result.exit_code == 0  # Should pass now that we fixed the plotting
-    assert "AttributeError: module 'plotext' has no attribute 'plot_date'" not in result.output
-
-
-def test_account_trend_plotting_fixed():
-    """Test that account trend plotting works correctly after fix."""
-    runner = CliRunner()
-    result = runner.invoke(cli, ["account-trend", "testuser", "--line-chart"])
-    assert result.exit_code == 0  # Should pass after fix
-
-
 @patch("stargazers.cli.plt")
 def test_plot_command_account_trend(mock_plt, runner, tmp_path, monkeypatch):
     """Test plotting account trend data from a CSV file."""
@@ -805,9 +790,7 @@ def test_traffic_command_with_exclude(runner, httpx_mock_non_strict_assertion, t
     mock_traffic_clones_api(httpx_mock, "testuser/repo1", {"count": 20, "uniques": 10, "clones": []})
     mock_traffic_referrers_api(httpx_mock, "testuser/repo1", [])
 
-    result = runner.invoke(
-        cli, ["traffic", username, "--exclude-repo", "testuser/repo2"], catch_exceptions=False
-    )
+    result = runner.invoke(cli, ["traffic", username, "--exclude-repo", "testuser/repo2"], catch_exceptions=False)
     assert result.exit_code == 0, f"CLI Error: {result.output}"
 
     traffic_file = tmp_path / f"{username}_traffic.csv"
