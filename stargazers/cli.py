@@ -85,7 +85,12 @@ def fetch_user_repos(username: str) -> list[str]:
     return repos
 
 
-def fetch_stargazers(repo: str) -> list:
+def fetch_stargazers(repo: str) -> tuple[list, bool]:
+    """Fetch stargazers for a repo.
+
+    Returns a ``(events, complete)`` tuple. ``complete`` is ``False`` when
+    pagination was cut short by a network error, so the events are partial.
+    """
     console.log(f"[bold blue]Fetching stargazers for:[/] {repo}")
     url = f"{GITHUB_API}/repos/{repo}/stargazers"
     params = {"per_page": 100, "page": 1}
@@ -95,9 +100,12 @@ def fetch_stargazers(repo: str) -> list:
         try:
             response = httpx.get(url, headers={**HEADERS, **STAR_HEADERS}, params=params)
         except httpx.RequestError as e:
-            console.log(f"[red]Request failed while fetching stargazers for {repo}: {e}[/]")
-            # Decide if to SystemExit or just return what's been fetched so far
-            return users_with_starred_at
+            console.log(
+                f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                f"(network error during pagination: {e})[/]"
+            )
+            # Return what was fetched so far, flagged as incomplete.
+            return users_with_starred_at, False
 
         error_action = _handle_api_error(response, f"fetching stargazers for repo {repo}")
         if error_action == "retry":
@@ -119,10 +127,15 @@ def fetch_stargazers(repo: str) -> list:
             break
         time.sleep(0.2)  # Brief pause
     console.log(f"Total stargazers fetched for {repo}: {len(users_with_starred_at)}")
-    return users_with_starred_at
+    return users_with_starred_at, True
 
 
-def fetch_forkers(repo: str) -> list:
+def fetch_forkers(repo: str) -> tuple[list, bool]:
+    """Fetch forkers for a repo.
+
+    Returns a ``(events, complete)`` tuple. ``complete`` is ``False`` when
+    pagination was cut short by a network error, so the events are partial.
+    """
     console.log(f"[bold blue]Fetching forkers for:[/] {repo}")
     url = f"{GITHUB_API}/repos/{repo}/forks"
     params = {"per_page": 100, "page": 1}
@@ -132,8 +145,12 @@ def fetch_forkers(repo: str) -> list:
         try:
             response = httpx.get(url, headers={**HEADERS, **DEFAULT_HEADERS}, params=params)
         except httpx.RequestError as e:
-            console.log(f"[red]Request failed while fetching forkers for {repo}: {e}[/]")
-            return fork_details  # Return what's fetched so far
+            console.log(
+                f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                f"(network error during pagination: {e})[/]"
+            )
+            # Return what was fetched so far, flagged as incomplete.
+            return fork_details, False
 
         error_action = _handle_api_error(response, f"fetching forkers for repo {repo}")
         if error_action == "retry":
@@ -158,7 +175,7 @@ def fetch_forkers(repo: str) -> list:
             break
         time.sleep(0.2)  # Brief pause
     console.log(f"Total forkers fetched for {repo}: {len(fork_details)}")
-    return fork_details
+    return fork_details, True
 
 
 def fetch_traffic_views(repo: str) -> dict | None:
@@ -411,7 +428,7 @@ def stargazers_repos_command(ctx, repositories: tuple[str]):
             console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
             continue
 
-        stargazer_events = fetch_stargazers(
+        stargazer_events, _complete = fetch_stargazers(
             repo_full_name
         )  # List of {'login': ..., 'starred_at': ..., 'user_details': ...}
 
@@ -446,7 +463,8 @@ def forkers_command(ctx, repositories: tuple[str]):
             console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
             continue
 
-        forker_events = fetch_forkers(repo_full_name)  # List of {'login': ..., 'forked_at': ..., 'user_details': ...}
+        # List of {'login': ..., 'forked_at': ..., 'user_details': ...}
+        forker_events, _complete = fetch_forkers(repo_full_name)
 
         for fk_event in forker_events:
             fk_event["repo"] = repo_full_name
@@ -523,9 +541,12 @@ def account_trend_command(ctx, username: str, exclude_repos: tuple[str], include
         return
 
     all_star_events = []
+    incomplete_repos = []
     for repo_name in track(repos_to_process, description=f"Fetching stars for {username}'s repos"):
         console.log(f"Fetching stars for repository: {repo_name}")
-        stargazer_events_for_repo = fetch_stargazers(repo_name)
+        stargazer_events_for_repo, complete = fetch_stargazers(repo_name)
+        if not complete:
+            incomplete_repos.append(repo_name)
         for star_event in stargazer_events_for_repo:
             all_star_events.append({"repo_name": repo_name, "starred_at": star_event["starred_at"]})
 
@@ -601,6 +622,13 @@ def account_trend_command(ctx, username: str, exclude_repos: tuple[str], include
     elif line_chart:
         console.log("[yellow]No data available to display the line chart.[/yellow]")
 
+    if incomplete_repos:
+        console.log(
+            "[bold red]WARNING: star data was incomplete for "
+            f"{len(incomplete_repos)} repo(s) ({', '.join(incomplete_repos)}) — "
+            "the saved trend may UNDERCOUNT stars. Re-run to get complete data.[/]"
+        )
+
     output_base_name = username
     summarize_and_save(final_df.to_dict("records"), output_base_name, "account_stars_by_day", timestamp_key="star_date")
 
@@ -627,12 +655,7 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
 
     Note: Requires a GITHUB_TOKEN with push access to the repos. Traffic data covers the last 14 days only.
     """
-    console.log(
-        "Command: 'traffic', "
-        f"User: {username}, "
-        f"Include Repos: {include_repos}, "
-        f"Exclude Repos: {exclude_repos}"
-    )
+    console.log(f"Command: 'traffic', User: {username}, Include Repos: {include_repos}, Exclude Repos: {exclude_repos}")
 
     user_owned_repos = fetch_user_repos(username)
     console.log(f"Found {len(user_owned_repos)} repositories owned by {username}.")
@@ -670,16 +693,20 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
         referrers = fetch_traffic_referrers(repo_name)
         time.sleep(0.2)
 
-        repo_views.append({
-            "repo": repo_name,
-            "views": views.get("count", 0),
-            "unique_views": views.get("uniques", 0),
-        })
-        repo_clones.append({
-            "repo": repo_name,
-            "clones": clones.get("count", 0) if clones else 0,
-            "unique_clones": clones.get("uniques", 0) if clones else 0,
-        })
+        repo_views.append(
+            {
+                "repo": repo_name,
+                "views": views.get("count", 0),
+                "unique_views": views.get("uniques", 0),
+            }
+        )
+        repo_clones.append(
+            {
+                "repo": repo_name,
+                "clones": clones.get("count", 0) if clones else 0,
+                "unique_clones": clones.get("uniques", 0) if clones else 0,
+            }
+        )
 
         if referrers:
             for ref in referrers:
@@ -720,12 +747,11 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
 
     # Aggregated referrers
     if all_referrers:
-        ref_df = pd.DataFrame([
-            {"referrer": k, "count": v["count"], "uniques": v["uniques"]}
-            for k, v in all_referrers.items()
-        ]).sort_values("count", ascending=False)
+        ref_df = pd.DataFrame(
+            [{"referrer": k, "count": v["count"], "uniques": v["uniques"]} for k, v in all_referrers.items()]
+        ).sort_values("count", ascending=False)
 
-        console.print(f"\n[bold]Top Referrers (aggregated across all repos):[/bold]")
+        console.print("\n[bold]Top Referrers (aggregated across all repos):[/bold]")
         for _, row in ref_df.head(15).iterrows():
             console.print(f"  {row['referrer']}: {row['count']:,} ({row['uniques']:,} unique)")
 
