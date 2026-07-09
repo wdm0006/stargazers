@@ -12,7 +12,7 @@ from rich.traceback import install
 
 load_dotenv()
 
-install(show_locals=True)
+install(show_locals=False)
 
 console = Console()
 
