@@ -627,12 +627,7 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
 
     Note: Requires a GITHUB_TOKEN with push access to the repos. Traffic data covers the last 14 days only.
     """
-    console.log(
-        "Command: 'traffic', "
-        f"User: {username}, "
-        f"Include Repos: {include_repos}, "
-        f"Exclude Repos: {exclude_repos}"
-    )
+    console.log(f"Command: 'traffic', User: {username}, Include Repos: {include_repos}, Exclude Repos: {exclude_repos}")
 
     user_owned_repos = fetch_user_repos(username)
     console.log(f"Found {len(user_owned_repos)} repositories owned by {username}.")
@@ -670,16 +665,20 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
         referrers = fetch_traffic_referrers(repo_name)
         time.sleep(0.2)
 
-        repo_views.append({
-            "repo": repo_name,
-            "views": views.get("count", 0),
-            "unique_views": views.get("uniques", 0),
-        })
-        repo_clones.append({
-            "repo": repo_name,
-            "clones": clones.get("count", 0) if clones else 0,
-            "unique_clones": clones.get("uniques", 0) if clones else 0,
-        })
+        repo_views.append(
+            {
+                "repo": repo_name,
+                "views": views.get("count", 0),
+                "unique_views": views.get("uniques", 0),
+            }
+        )
+        repo_clones.append(
+            {
+                "repo": repo_name,
+                "clones": clones.get("count", 0) if clones else 0,
+                "unique_clones": clones.get("uniques", 0) if clones else 0,
+            }
+        )
 
         if referrers:
             for ref in referrers:
@@ -720,12 +719,11 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
 
     # Aggregated referrers
     if all_referrers:
-        ref_df = pd.DataFrame([
-            {"referrer": k, "count": v["count"], "uniques": v["uniques"]}
-            for k, v in all_referrers.items()
-        ]).sort_values("count", ascending=False)
+        ref_df = pd.DataFrame(
+            [{"referrer": k, "count": v["count"], "uniques": v["uniques"]} for k, v in all_referrers.items()]
+        ).sort_values("count", ascending=False)
 
-        console.print(f"\n[bold]Top Referrers (aggregated across all repos):[/bold]")
+        console.print("\n[bold]Top Referrers (aggregated across all repos):[/bold]")
         for _, row in ref_df.head(15).iterrows():
             console.print(f"  {row['referrer']}: {row['count']:,} ({row['uniques']:,} unique)")
 
