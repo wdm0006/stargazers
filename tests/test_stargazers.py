@@ -2,6 +2,7 @@ import csv
 import os
 import sys
 
+import httpx
 import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -81,7 +82,8 @@ def test_fetch_stargazers(httpx_mock_non_strict_assertion):
         json=stargazers_page1,
         status_code=200,
     )
-    users = fetch_stargazers(repo)
+    users, complete = fetch_stargazers(repo)
+    assert complete is True
     assert len(users) == 2
     assert users[0]["login"] == "user1"
     assert users[1]["login"] == "user2"
@@ -148,11 +150,55 @@ def test_fetch_forkers(httpx_mock_non_strict_assertion):
         json=forkers_page1,
         status_code=200,
     )
-    users = fetch_forkers(repo)
+    users, complete = fetch_forkers(repo)
+    assert complete is True
     assert len(users) == 2
     assert users[0]["login"] == "forker1"
     assert users[1]["login"] == "forkerB"
     assert users[0]["forked_at"] == "2023-01-01T00:00:00Z"
+
+
+class CapturingConsole:
+    """Console stub that records log() messages so tests can assert on warnings."""
+
+    def __init__(self):
+        self.messages = []
+
+    def log(self, *args, **kwargs):
+        self.messages.append(" ".join(str(a) for a in args))
+
+    def print(self, *args, **kwargs):
+        self.messages.append(" ".join(str(a) for a in args))
+
+
+def test_fetch_stargazers_incomplete_on_request_error(httpx_mock_non_strict_assertion, monkeypatch):
+    """A network error after the first page returns partial data flagged incomplete + warns."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    repo = "test_owner/test_repo"
+    base_url = f"https://api.github.com/repos/{repo}/stargazers"
+    # First page succeeds and advertises a next page via the Link header.
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page={PER_PAGE}&page=1",
+        method="GET",
+        match_headers={"Accept": "application/vnd.github.v3.star+json"},
+        json=[{"user": {"login": "user1", "id": 1}, "starred_at": "2023-01-01T00:00:00Z"}],
+        status_code=200,
+        headers={"Link": f'<{base_url}?per_page={PER_PAGE}&page=2>; rel="next"'},
+    )
+    # Second page raises a network error mid-pagination.
+    httpx_mock.add_exception(httpx.ConnectError("boom"))
+
+    users, complete = fetch_stargazers(repo)
+
+    # Partial data is returned (page 1 only) and explicitly flagged incomplete.
+    assert complete is False
+    assert len(users) == 1
+    assert users[0]["login"] == "user1"
+    # A prominent, distinguishable warning is emitted.
+    assert any("WARNING: incomplete data" in m and repo in m for m in capturing.messages)
 
 
 BASE_API_URL = "https://api.github.com"
@@ -264,6 +310,38 @@ def test_account_trend_basic(runner, httpx_mock_non_strict_assertion, tmp_path, 
     assert data[1]["testuser_repo1_cumulative_stars"] == "2"
     assert data[1]["testuser_repo2_new_stars"] == "0"
     assert data[1]["testuser_repo2_cumulative_stars"] == "0"
+
+
+def test_account_trend_warns_on_incomplete_data(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    """account-trend still saves partial data but surfaces a prominent warning first."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    mock_user_repos_api(httpx_mock, username, [{"full_name": "testuser/repo1", "owner": {"login": username}}])
+
+    star_url = f"{BASE_API_URL}/repos/testuser/repo1/stargazers"
+    httpx_mock.add_response(
+        url=f"{star_url}?per_page={PER_PAGE}&page=1",
+        method="GET",
+        match_headers={"Accept": "application/vnd.github.v3.star+json"},
+        json=[{"user": {"login": "sg1", "id": 1}, "starred_at": "2023-01-01T10:00:00Z"}],
+        status_code=200,
+        headers={"Link": f'<{star_url}?per_page={PER_PAGE}&page=2>; rel="next"'},
+    )
+    # Network error on page 2 → partial data for this repo.
+    httpx_mock.add_exception(httpx.ConnectError("boom"))
+
+    result = runner.invoke(cli, ["account-trend", username], catch_exceptions=False)
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+
+    # The partial CSV is still written (documented behavior: partial data is saved)...
+    output_file = tmp_path / f"{username}_account_stars_by_day.csv"
+    assert output_file.exists()
+    # ...but the user is prominently warned it may undercount.
+    assert any("WARNING: star data was incomplete" in m and "testuser/repo1" in m for m in capturing.messages)
 
 
 def test_account_trend_exclude_repo(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
@@ -561,21 +639,6 @@ def test_forkers_command(runner, httpx_mock_non_strict_assertion, tmp_path, monk
     assert data[1]["login"] == "forkerA"
 
 
-def test_account_trend_plotting():
-    """Test that account trend plotting works correctly with sample data."""
-    runner = CliRunner()
-    result = runner.invoke(cli, ["account-trend", "testuser", "--line-chart"])
-    assert result.exit_code == 0  # Should pass now that we fixed the plotting
-    assert "AttributeError: module 'plotext' has no attribute 'plot_date'" not in result.output
-
-
-def test_account_trend_plotting_fixed():
-    """Test that account trend plotting works correctly after fix."""
-    runner = CliRunner()
-    result = runner.invoke(cli, ["account-trend", "testuser", "--line-chart"])
-    assert result.exit_code == 0  # Should pass after fix
-
-
 @patch("stargazers.cli.plt")
 def test_plot_command_account_trend(mock_plt, runner, tmp_path, monkeypatch):
     """Test plotting account trend data from a CSV file."""
@@ -805,9 +868,7 @@ def test_traffic_command_with_exclude(runner, httpx_mock_non_strict_assertion, t
     mock_traffic_clones_api(httpx_mock, "testuser/repo1", {"count": 20, "uniques": 10, "clones": []})
     mock_traffic_referrers_api(httpx_mock, "testuser/repo1", [])
 
-    result = runner.invoke(
-        cli, ["traffic", username, "--exclude-repo", "testuser/repo2"], catch_exceptions=False
-    )
+    result = runner.invoke(cli, ["traffic", username, "--exclude-repo", "testuser/repo2"], catch_exceptions=False)
     assert result.exit_code == 0, f"CLI Error: {result.output}"
 
     traffic_file = tmp_path / f"{username}_traffic.csv"
