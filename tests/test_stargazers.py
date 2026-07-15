@@ -66,6 +66,25 @@ def httpx_mock_non_strict_assertion(httpx_mock: HTTPXMock):
     yield httpx_mock
 
 
+def test_cli_does_not_log_token_and_warns_when_unset(monkeypatch):
+    messages = []
+
+    class RecordingConsole:
+        def log(self, message):
+            messages.append(message)
+
+    monkeypatch.setattr("stargazers.cli.console", RecordingConsole())
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token-value")
+    cli.callback()
+
+    assert messages == []
+
+    monkeypatch.delenv("GITHUB_TOKEN")
+    cli.callback()
+
+    assert messages == ["[yellow]Warning: GITHUB_TOKEN not set. You may hit rate limits quickly.[/]"]
+
+
 def test_fetch_stargazers(httpx_mock_non_strict_assertion):
     httpx_mock = httpx_mock_non_strict_assertion  # Use the yielded mock
     repo = "test_owner/test_repo"
