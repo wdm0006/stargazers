@@ -22,6 +22,9 @@ HEADERS = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 DEFAULT_HEADERS = {"Accept": "application/vnd.github.v3+json"}
 STAR_HEADERS = {"Accept": "application/vnd.github.v3.star+json"}
 
+# Maximum number of rate-limit retries for a single page of a paginated fetch.
+MAX_RATE_LIMIT_RETRIES = 5
+
 
 def _handle_api_error(response: httpx.Response, context_message: str):
     """Handles common API errors."""
@@ -55,6 +58,7 @@ def fetch_user_repos(username: str) -> list[str]:
     repos = []
     url = f"{GITHUB_API}/users/{username}/repos"
     params = {"type": "owner", "sort": "full_name", "per_page": 100, "page": 1}
+    rate_limit_retries = 0
 
     while True:
         console.log(f"Requesting: {url} with params {params}")
@@ -66,7 +70,15 @@ def fetch_user_repos(username: str) -> list[str]:
 
         error_action = _handle_api_error(response, f"fetching repos for user {username}")
         if error_action == "retry":
+            rate_limit_retries += 1
+            if rate_limit_retries > MAX_RATE_LIMIT_RETRIES:
+                console.log(
+                    f"[bold red]Giving up fetching repos for {username} — still rate limited after "
+                    f"{MAX_RATE_LIMIT_RETRIES} retries on page {params['page']}.[/]"
+                )
+                raise SystemExit(1)
             continue  # Retry the current page request
+        rate_limit_retries = 0
 
         batch = response.json()
         if not batch:
@@ -89,12 +101,14 @@ def fetch_stargazers(repo: str) -> tuple[list, bool]:
     """Fetch stargazers for a repo.
 
     Returns a ``(events, complete)`` tuple. ``complete`` is ``False`` when
-    pagination was cut short by a network error, so the events are partial.
+    pagination was cut short by a network error or by exhausting
+    ``MAX_RATE_LIMIT_RETRIES``, so the events are partial.
     """
     console.log(f"[bold blue]Fetching stargazers for:[/] {repo}")
     url = f"{GITHUB_API}/repos/{repo}/stargazers"
     params = {"per_page": 100, "page": 1}
     users_with_starred_at = []
+    rate_limit_retries = 0
     while True:
         console.log(f"Requesting: {url} with params {params}")
         try:
@@ -109,7 +123,15 @@ def fetch_stargazers(repo: str) -> tuple[list, bool]:
 
         error_action = _handle_api_error(response, f"fetching stargazers for repo {repo}")
         if error_action == "retry":
+            rate_limit_retries += 1
+            if rate_limit_retries > MAX_RATE_LIMIT_RETRIES:
+                console.log(
+                    f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                    f"(still rate limited after {MAX_RATE_LIMIT_RETRIES} retries)[/]"
+                )
+                return users_with_starred_at, False
             continue
+        rate_limit_retries = 0
 
         batch = response.json()
         console.log(f"Fetched {len(batch)} stargazers in this batch.")
@@ -134,12 +156,14 @@ def fetch_forkers(repo: str) -> tuple[list, bool]:
     """Fetch forkers for a repo.
 
     Returns a ``(events, complete)`` tuple. ``complete`` is ``False`` when
-    pagination was cut short by a network error, so the events are partial.
+    pagination was cut short by a network error or by exhausting
+    ``MAX_RATE_LIMIT_RETRIES``, so the events are partial.
     """
     console.log(f"[bold blue]Fetching forkers for:[/] {repo}")
     url = f"{GITHUB_API}/repos/{repo}/forks"
     params = {"per_page": 100, "page": 1}
     fork_details = []
+    rate_limit_retries = 0
     while True:
         console.log(f"Requesting: {url} with params {params}")
         try:
@@ -154,7 +178,15 @@ def fetch_forkers(repo: str) -> tuple[list, bool]:
 
         error_action = _handle_api_error(response, f"fetching forkers for repo {repo}")
         if error_action == "retry":
+            rate_limit_retries += 1
+            if rate_limit_retries > MAX_RATE_LIMIT_RETRIES:
+                console.log(
+                    f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                    f"(still rate limited after {MAX_RATE_LIMIT_RETRIES} retries)[/]"
+                )
+                return fork_details, False
             continue
+        rate_limit_retries = 0
 
         batch = response.json()
         console.log(f"Fetched {len(batch)} forkers in this batch.")
