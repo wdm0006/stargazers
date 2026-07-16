@@ -13,6 +13,7 @@ from click.testing import CliRunner
 from pytest_httpx import HTTPXMock  # Import HTTPXMock for type hinting
 
 from stargazers.cli import (
+    MAX_RATE_LIMIT_RETRIES,
     cli,
     fetch_forkers,
     fetch_stargazers,
@@ -20,6 +21,7 @@ from stargazers.cli import (
     fetch_traffic_referrers,
     fetch_traffic_views,
     fetch_user_metadata,
+    fetch_user_repos,
     summarize_and_save,
 )
 
@@ -170,6 +172,16 @@ class CapturingConsole:
     def print(self, *args, **kwargs):
         self.messages.append(" ".join(str(a) for a in args))
 
+    def status(self, *args, **kwargs):
+        class DummyStatus:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                pass
+
+        return DummyStatus()
+
 
 def test_fetch_stargazers_incomplete_on_request_error(httpx_mock_non_strict_assertion, monkeypatch):
     """A network error after the first page returns partial data flagged incomplete + warns."""
@@ -199,6 +211,128 @@ def test_fetch_stargazers_incomplete_on_request_error(httpx_mock_non_strict_asse
     assert users[0]["login"] == "user1"
     # A prominent, distinguishable warning is emitted.
     assert any("WARNING: incomplete data" in m and repo in m for m in capturing.messages)
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    """Skip the rate-limit waits so retry-cap tests run instantly."""
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+
+
+def test_fetch_stargazers_caps_rate_limit_retries(httpx_mock_non_strict_assertion, monkeypatch, no_sleep):
+    """A persistent rate-limit 403 stops after the cap and returns partial data."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    repo = "test_owner/test_repo"
+    base_url = f"https://api.github.com/repos/{repo}/stargazers"
+    # First page succeeds and advertises a next page via the Link header.
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page={PER_PAGE}&page=1",
+        method="GET",
+        json=[{"user": {"login": "user1", "id": 1}, "starred_at": "2023-01-01T00:00:00Z"}],
+        status_code=200,
+        headers={"Link": f'<{base_url}?per_page={PER_PAGE}&page=2>; rel="next"'},
+    )
+    # Page 2 is rate limited forever.
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page={PER_PAGE}&page=2",
+        method="GET",
+        status_code=403,
+        text="API rate limit exceeded",
+        is_reusable=True,
+    )
+
+    users, complete = fetch_stargazers(repo)
+
+    assert complete is False
+    assert len(users) == 1
+    assert users[0]["login"] == "user1"
+    # Page 2 was attempted exactly MAX_RATE_LIMIT_RETRIES + 1 times, then abandoned.
+    page2_requests = [r for r in httpx_mock.get_requests() if "page=2" in str(r.url)]
+    assert len(page2_requests) == MAX_RATE_LIMIT_RETRIES + 1
+    assert any("WARNING: incomplete data" in m and repo in m for m in capturing.messages)
+
+
+def test_fetch_forkers_caps_rate_limit_retries(httpx_mock_non_strict_assertion, monkeypatch, no_sleep):
+    """A persistent rate-limit 403 stops after the cap and returns partial data."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    repo = "test_owner/test_repo"
+    base_url = f"https://api.github.com/repos/{repo}/forks"
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page={PER_PAGE}&page=1",
+        method="GET",
+        json=[{"owner": {"login": "forker1", "id": 101}, "created_at": "2023-01-01T00:00:00Z"}],
+        status_code=200,
+        headers={"Link": f'<{base_url}?per_page={PER_PAGE}&page=2>; rel="next"'},
+    )
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page={PER_PAGE}&page=2",
+        method="GET",
+        status_code=403,
+        text="API rate limit exceeded",
+        is_reusable=True,
+    )
+
+    forkers, complete = fetch_forkers(repo)
+
+    assert complete is False
+    assert len(forkers) == 1
+    assert forkers[0]["login"] == "forker1"
+    page2_requests = [r for r in httpx_mock.get_requests() if "page=2" in str(r.url)]
+    assert len(page2_requests) == MAX_RATE_LIMIT_RETRIES + 1
+    assert any("WARNING: incomplete data" in m and repo in m for m in capturing.messages)
+
+
+def test_fetch_user_repos_caps_rate_limit_retries(httpx_mock_non_strict_assertion, monkeypatch, no_sleep):
+    """A persistent rate-limit 403 exits rather than retrying the same page forever."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/users/testuser/repos?type=owner&sort=full_name&per_page={PER_PAGE}&page=1",
+        method="GET",
+        status_code=403,
+        text="API rate limit exceeded",
+        is_reusable=True,
+    )
+
+    with pytest.raises(SystemExit):
+        fetch_user_repos("testuser")
+
+    assert len(httpx_mock.get_requests()) == MAX_RATE_LIMIT_RETRIES + 1
+    assert any("Giving up fetching repos for testuser" in m for m in capturing.messages)
+
+
+def test_fetch_stargazers_recovers_from_transient_rate_limit(httpx_mock_non_strict_assertion, monkeypatch, no_sleep):
+    """Retries below the cap still succeed, and the counter resets per page."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    monkeypatch.setattr("stargazers.cli.console", CapturingConsole())
+
+    repo = "test_owner/test_repo"
+    base_url = f"https://api.github.com/repos/{repo}/stargazers"
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page={PER_PAGE}&page=1",
+        method="GET",
+        status_code=403,
+        text="API rate limit exceeded",
+    )
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page={PER_PAGE}&page=1",
+        method="GET",
+        json=[{"user": {"login": "user1", "id": 1}, "starred_at": "2023-01-01T00:00:00Z"}],
+        status_code=200,
+    )
+
+    users, complete = fetch_stargazers(repo)
+
+    assert complete is True
+    assert [u["login"] for u in users] == ["user1"]
 
 
 BASE_API_URL = "https://api.github.com"
