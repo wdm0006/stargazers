@@ -442,8 +442,6 @@ def cli():
     or star trends for GitHub repositories and users.
     """
     token = os.getenv("GITHUB_TOKEN")
-    redacted = token[:4] + "..." + token[-4:] if token and len(token) > 8 else "Not Set"
-    console.log(f"DEBUG: GITHUB_TOKEN Status: {redacted}")
     if not token:
         console.log("[yellow]Warning: GITHUB_TOKEN not set. You may hit rate limits quickly.[/]")
 
