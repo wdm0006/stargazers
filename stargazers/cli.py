@@ -26,6 +26,17 @@ STAR_HEADERS = {"Accept": "application/vnd.github.v3.star+json"}
 MAX_RATE_LIMIT_RETRIES = 5
 
 
+def _valid_repo_args(values: tuple[str]) -> list[str]:
+    """Drop any value that is not in 'owner/repo' form, logging a warning for each."""
+    valid = []
+    for value in values:
+        if "/" not in value:
+            console.log(f"[red]Invalid repository format: '{value}'. Must be 'owner/repo'.[/]")
+            continue
+        valid.append(value)
+    return valid
+
+
 def _handle_api_error(response: httpx.Response, context_message: str):
     """Handles common API errors."""
     if response.status_code == 404:
@@ -544,6 +555,9 @@ def account_trend_command(ctx, username: str, exclude_repos: tuple[str], include
         f"Line Chart: {line_chart}"
     )
 
+    include_repos = _valid_repo_args(include_repos)
+    exclude_repos = _valid_repo_args(exclude_repos)
+
     user_owned_repos = fetch_user_repos(username)
     console.log(f"Found {len(user_owned_repos)} repositories owned by {username}.")
 
@@ -686,6 +700,9 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
     Note: Requires a GITHUB_TOKEN with push access to the repos. Traffic data covers the last 14 days only.
     """
     console.log(f"Command: 'traffic', User: {username}, Include Repos: {include_repos}, Exclude Repos: {exclude_repos}")
+
+    include_repos = _valid_repo_args(include_repos)
+    exclude_repos = _valid_repo_args(exclude_repos)
 
     user_owned_repos = fetch_user_repos(username)
     console.log(f"Found {len(user_owned_repos)} repositories owned by {username}.")
