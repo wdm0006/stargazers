@@ -571,6 +571,33 @@ def test_account_trend_include_repo(runner, httpx_mock_non_strict_assertion, tmp
     assert data[1]["external_another_repo_cumulative_stars"] == "0"
 
 
+def test_account_trend_invalid_include_repo(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    """A malformed --include-repo is warned about and dropped; owned repos still process."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    mock_user_repos_api(httpx_mock, username, [{"full_name": "testuser/owned_repo", "owner": {"login": username}}])
+    mock_stargazers_api(httpx_mock, "testuser/owned_repo", [{"starred_at": "2023-02-01T00:00:00Z"}])
+
+    # "notarepo" has no slash — it must never reach fetch_stargazers (no mock for it).
+    result = runner.invoke(cli, ["account-trend", username, "--include-repo", "notarepo"], catch_exceptions=False)
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+
+    assert any("Invalid repository format: 'notarepo'" in m for m in capturing.messages)
+
+    # The valid owned repo is still processed and the trend CSV is written.
+    output_file = tmp_path / f"{username}_account_stars_by_day.csv"
+    assert output_file.exists()
+    data = read_csv_output(output_file)
+    assert len(data) == 1
+    assert data[0]["star_date"] == "2023-02-01"
+    assert data[0]["total_new_stars_on_day"] == "1"
+    assert data[0]["testuser_owned_repo_new_stars"] == "1"
+
+
 @patch("stargazers.cli.plt")
 def test_account_trend_line_chart(mock_plt, runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
     httpx_mock = httpx_mock_non_strict_assertion  # Use the yielded mock
@@ -1029,6 +1056,34 @@ def test_traffic_command_with_exclude(runner, httpx_mock_non_strict_assertion, t
     data = read_csv_output(traffic_file)
     assert len(data) == 1
     assert data[0]["repo"] == "testuser/repo1"
+
+
+def test_traffic_command_invalid_include_repo(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    """A malformed --include-repo is warned about and dropped; owned repos still process."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    mock_user_repos_api(httpx_mock, username, [{"full_name": "testuser/repo1", "owner": {"login": username}}])
+    mock_traffic_views_api(httpx_mock, "testuser/repo1", {"count": 100, "uniques": 50, "views": []})
+    mock_traffic_clones_api(httpx_mock, "testuser/repo1", {"count": 20, "uniques": 10, "clones": []})
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo1", [])
+
+    # "notarepo" has no slash — it must never reach the traffic fetchers (no mock for it).
+    result = runner.invoke(cli, ["traffic", username, "--include-repo", "notarepo"], catch_exceptions=False)
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+
+    assert any("Invalid repository format: 'notarepo'" in m for m in capturing.messages)
+
+    # The valid owned repo is still processed and the traffic CSV is written.
+    traffic_file = tmp_path / f"{username}_traffic.csv"
+    assert traffic_file.exists()
+    data = read_csv_output(traffic_file)
+    assert len(data) == 1
+    assert data[0]["repo"] == "testuser/repo1"
+    assert data[0]["views"] == "100"
 
 
 def test_traffic_command_skips_no_access(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
