@@ -108,7 +108,7 @@ def fetch_user_repos(username: str) -> list[str]:
     return repos
 
 
-def fetch_stargazers(repo: str) -> tuple[list, bool]:
+def fetch_stargazers(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]:
     """Fetch stargazers for a repo.
 
     Returns a ``(events, complete)`` tuple. ``complete`` is ``False`` when
@@ -130,6 +130,10 @@ def fetch_stargazers(repo: str) -> tuple[list, bool]:
                 f"(network error during pagination: {e})[/]"
             )
             # Return what was fetched so far, flagged as incomplete.
+            return users_with_starred_at, False
+
+        if skip_missing and response.status_code == 404:
+            console.log(f"[yellow]Repository {repo} not found, skipping star data.[/]")
             return users_with_starred_at, False
 
         error_action = _handle_api_error(response, f"fetching stargazers for repo {repo}")
@@ -230,8 +234,9 @@ def fetch_traffic_views(repo: str) -> dict | None:
         console.log(f"[red]Request failed fetching views for {repo}: {e}[/]")
         return None
 
-    if response.status_code == 403:
-        console.log(f"[yellow]No push access to {repo}, skipping traffic data.[/]")
+    if response.status_code in (403, 404):
+        reason = "No push access to" if response.status_code == 403 else "Repository not found:"
+        console.log(f"[yellow]{reason} {repo}, skipping traffic data.[/]")
         return None
 
     error_action = _handle_api_error(response, f"fetching traffic views for {repo}")
@@ -255,8 +260,9 @@ def fetch_traffic_clones(repo: str) -> dict | None:
         console.log(f"[red]Request failed fetching clones for {repo}: {e}[/]")
         return None
 
-    if response.status_code == 403:
-        console.log(f"[yellow]No push access to {repo}, skipping clone data.[/]")
+    if response.status_code in (403, 404):
+        reason = "No push access to" if response.status_code == 403 else "Repository not found:"
+        console.log(f"[yellow]{reason} {repo}, skipping clone data.[/]")
         return None
 
     error_action = _handle_api_error(response, f"fetching traffic clones for {repo}")
@@ -280,8 +286,9 @@ def fetch_traffic_referrers(repo: str) -> list | None:
         console.log(f"[red]Request failed fetching referrers for {repo}: {e}[/]")
         return None
 
-    if response.status_code == 403:
-        console.log(f"[yellow]No push access to {repo}, skipping referrer data.[/]")
+    if response.status_code in (403, 404):
+        reason = "No push access to" if response.status_code == 403 else "Repository not found:"
+        console.log(f"[yellow]{reason} {repo}, skipping referrer data.[/]")
         return None
 
     error_action = _handle_api_error(response, f"fetching traffic referrers for {repo}")
@@ -588,7 +595,7 @@ def account_trend_command(ctx, username: str, exclude_repos: tuple[str], include
     incomplete_repos = []
     for repo_name in track(repos_to_process, description=f"Fetching stars for {username}'s repos"):
         console.log(f"Fetching stars for repository: {repo_name}")
-        stargazer_events_for_repo, complete = fetch_stargazers(repo_name)
+        stargazer_events_for_repo, complete = fetch_stargazers(repo_name, skip_missing=True)
         if not complete:
             incomplete_repos.append(repo_name)
         for star_event in stargazer_events_for_repo:
@@ -778,7 +785,7 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
 
     # Print summary
     console.print("\n[bold]Traffic Summary (last 14 days)[/bold]")
-    console.print(f"Repos analyzed: {len(repo_views)} (skipped {skipped} due to access)")
+    console.print(f"Repos analyzed: {len(repo_views)} (skipped {skipped} due to access or missing repositories)")
     console.print(f"\n[bold]Total Views:[/bold] {total_views:,} ({total_unique_views:,} unique)")
     console.print(f"[bold]Total Clones:[/bold] {total_clones:,} ({total_unique_clones:,} unique)")
 

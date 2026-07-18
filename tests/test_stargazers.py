@@ -497,6 +497,43 @@ def test_account_trend_warns_on_incomplete_data(runner, httpx_mock_non_strict_as
     assert any("WARNING: star data was incomplete" in m and "testuser/repo1" in m for m in capturing.messages)
 
 
+def test_account_trend_skips_missing_repo(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    mock_user_repos_api(httpx_mock, username, [{"full_name": "testuser/repo1", "owner": {"login": username}}])
+    mock_stargazers_api(
+        httpx_mock,
+        "testuser/repo1",
+        [{"login": "sg1", "starred_at": "2023-01-01T10:00:00Z"}],
+    )
+    missing_repo = "external/does-not-exist"
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/{missing_repo}/stargazers?per_page={PER_PAGE}&page=1",
+        method="GET",
+        status_code=404,
+        json={"message": "Not Found"},
+    )
+
+    result = runner.invoke(cli, ["account-trend", username, "--include-repo", missing_repo], catch_exceptions=False)
+    assert result.exit_code == 0
+
+    data = read_csv_output(tmp_path / f"{username}_account_stars_by_day.csv")
+    assert data == [
+        {
+            "star_date": "2023-01-01",
+            "total_new_stars_on_day": "1",
+            "total_cumulative_stars_up_to_day": "1",
+            "testuser_repo1_new_stars": "1",
+            "testuser_repo1_cumulative_stars": "1",
+        }
+    ]
+    assert any("WARNING: star data was incomplete" in m and missing_repo in m for m in capturing.messages)
+
+
 def test_account_trend_exclude_repo(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
     httpx_mock = httpx_mock_non_strict_assertion  # Use the yielded mock
     username = "testuser"
@@ -772,6 +809,27 @@ def test_repos_command(runner, httpx_mock_non_strict_assertion, tmp_path, monkey
     assert len(data) == 2
     assert data[0]["login"] == sample_stargazer_data[1]["login"]
     assert data[1]["login"] == sample_stargazer_data[0]["login"]
+
+
+def test_repos_command_missing_repo_still_exits(runner, httpx_mock_non_strict_assertion, monkeypatch):
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    repo_name = "testowner/does-not-exist"
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/{repo_name}/stargazers?per_page={PER_PAGE}&page=1",
+        method="GET",
+        status_code=404,
+        json={"message": "Not Found"},
+    )
+
+    result = runner.invoke(cli, ["repos", repo_name])
+
+    assert result.exit_code == 1
+    assert any(
+        f"fetching stargazers for repo {repo_name} not found. Please check the input and try again." in message
+        for message in capturing.messages
+    )
 
 
 def test_forkers_command(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
@@ -1117,3 +1175,45 @@ def test_traffic_command_skips_no_access(runner, httpx_mock_non_strict_assertion
     data = read_csv_output(traffic_file)
     assert len(data) == 1
     assert data[0]["repo"] == "testuser/repo1"
+
+
+def test_traffic_command_skips_missing_repo(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    mock_user_repos_api(
+        httpx_mock,
+        username,
+        [
+            {"full_name": "testuser/repo1", "owner": {"login": username}},
+            {"full_name": "testuser/missing", "owner": {"login": username}},
+        ],
+    )
+    mock_traffic_views_api(httpx_mock, "testuser/repo1", {"count": 50, "uniques": 25, "views": []})
+    mock_traffic_clones_api(httpx_mock, "testuser/repo1", {"count": 10, "uniques": 5, "clones": []})
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo1", [])
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/testuser/missing/traffic/views",
+        method="GET",
+        status_code=404,
+        json={"message": "Not Found"},
+    )
+
+    result = runner.invoke(cli, ["traffic", username], catch_exceptions=False)
+    assert result.exit_code == 0
+
+    data = read_csv_output(tmp_path / f"{username}_traffic.csv")
+    assert data == [
+        {
+            "repo": "testuser/repo1",
+            "views": "50",
+            "unique_views": "25",
+            "clones": "10",
+            "unique_clones": "5",
+        }
+    ]
+    assert any("Repository not found:" in m and "testuser/missing" in m for m in capturing.messages)
+    assert any("Repos analyzed: 1 (skipped 1 due to access or missing repositories)" in m for m in capturing.messages)
