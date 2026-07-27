@@ -1,6 +1,7 @@
 import csv
 import os
 import sys
+import time
 
 import httpx
 import pandas as pd
@@ -352,6 +353,78 @@ def test_fetch_stargazers_recovers_from_transient_rate_limit(httpx_mock_non_stri
 
     assert complete is True
     assert [u["login"] for u in users] == ["user1"]
+
+
+@pytest.fixture
+def recorded_sleeps(monkeypatch):
+    """Record every time.sleep() duration instead of actually sleeping."""
+    sleeps = []
+    monkeypatch.setattr("stargazers.cli.time.sleep", sleeps.append)
+    return sleeps
+
+
+def test_fetch_user_metadata_retries_rate_limit_without_extra_sleep(httpx_mock, recorded_sleeps):
+    """A rate-limited user is retried using only _handle_api_error's reset-time wait."""
+    reset_at = int(time.time()) + 5
+    httpx_mock.add_response(
+        url="https://api.github.com/users/user1",
+        method="GET",
+        status_code=403,
+        text="API rate limit exceeded",
+        headers={"X-RateLimit-Reset": str(reset_at)},
+    )
+    httpx_mock.add_response(
+        url="https://api.github.com/users/user1",
+        method="GET",
+        json={
+            "login": "user1",
+            "name": "User One",
+            "company": "TestCo",
+            "location": "Earth",
+            "email": "user1@example.com",
+            "bio": "Bio1",
+            "followers": 10,
+            "public_repos": 5,
+        },
+        status_code=200,
+    )
+
+    metadata = fetch_user_metadata([{"login": "user1", "starred_at": "2023-01-01T00:00:00Z", "user_details": None}])
+
+    # The retry succeeded and the user was enriched.
+    assert len(httpx_mock.get_requests()) == 2
+    assert len(metadata) == 1
+    assert metadata[0]["login"] == "user1"
+    assert metadata[0]["location"] == "Earth"
+    assert metadata[0]["followers"] == 10
+    assert metadata[0]["starred_at"] == "2023-01-01T00:00:00Z"
+
+    # Exactly two sleeps: the reset-time wait, then the 0.1s post-success pause.
+    # The old redundant fixed 60s wait after the "retry" signal is gone.
+    assert recorded_sleeps == [pytest.approx(reset_at - int(time.time()), abs=1), 0.1]
+    assert 60 not in recorded_sleeps
+
+
+def test_fetch_user_metadata_caps_rate_limit_retries(httpx_mock_non_strict_assertion, recorded_sleeps):
+    """A persistent rate limit gives up after max_retries attempts and skips the user."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    reset_at = int(time.time()) + 5
+    httpx_mock.add_response(
+        url="https://api.github.com/users/user1",
+        method="GET",
+        status_code=403,
+        text="API rate limit exceeded",
+        headers={"X-RateLimit-Reset": str(reset_at)},
+        is_reusable=True,
+    )
+
+    metadata = fetch_user_metadata([{"login": "user1", "starred_at": "2023-01-01T00:00:00Z", "user_details": None}])
+
+    assert metadata == []
+    # max_retries = 3 attempts, each waiting once inside _handle_api_error and no more.
+    assert len(httpx_mock.get_requests()) == 3
+    assert len(recorded_sleeps) == 3
+    assert 60 not in recorded_sleeps
 
 
 BASE_API_URL = "https://api.github.com"

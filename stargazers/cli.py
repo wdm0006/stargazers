@@ -356,10 +356,8 @@ def fetch_user_metadata(users_info: list, timestamp_key: str = "starred_at") -> 
 
             error_action = _handle_api_error(r, f"fetching metadata for user {username}")
             if error_action == "retry":
-                # For user metadata, a simpler retry without complex backoff here,
-                # as the main rate limit handling is at the list level.
-                console.log(f"[yellow]Rate limit hit for user {username}. Waiting 60s and retrying...[/]")
-                time.sleep(60)
+                # _handle_api_error already waited out the rate limit before signalling a retry.
+                console.log(f"[yellow]Retrying metadata fetch for user {username}.[/]")
                 retries += 1
                 continue
 
