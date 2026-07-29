@@ -1380,6 +1380,73 @@ def test_fetch_traffic_views_no_access(httpx_mock):
     assert result is None
 
 
+@pytest.mark.parametrize(
+    ("fetcher", "endpoint", "payload"),
+    [
+        (fetch_traffic_views, "views", {"count": 101, "uniques": 51, "views": []}),
+        (fetch_traffic_clones, "clones", {"count": 26, "uniques": 11, "clones": []}),
+        (
+            fetch_traffic_referrers,
+            "popular/referrers",
+            [{"referrer": "github.com", "count": 81, "uniques": 41}],
+        ),
+    ],
+)
+def test_fetch_traffic_retries_rate_limit(httpx_mock, monkeypatch, fetcher, endpoint, payload):
+    repo = "testowner/testrepo"
+    url = f"{BASE_API_URL}/repos/{repo}/traffic/{endpoint}"
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    httpx_mock.add_response(
+        url=url,
+        method="GET",
+        status_code=403,
+        text="API rate limit exceeded for user ID 1.",
+        headers={"X-RateLimit-Reset": str(int(time.time()) + 5)},
+    )
+    httpx_mock.add_response(url=url, method="GET", status_code=200, json=payload)
+
+    result = fetcher(repo)
+
+    assert len([request for request in httpx_mock.get_requests() if str(request.url) == url]) == 2
+    if endpoint == "popular/referrers":
+        assert result[0]["count"] == 81
+        assert result[0]["uniques"] == 41
+    else:
+        assert result["count"] == payload["count"]
+        assert result["uniques"] == payload["uniques"]
+
+
+@pytest.mark.parametrize(
+    ("fetcher", "endpoint"),
+    [
+        (fetch_traffic_views, "views"),
+        (fetch_traffic_clones, "clones"),
+        (fetch_traffic_referrers, "popular/referrers"),
+    ],
+)
+def test_fetch_traffic_persistent_rate_limit_warns(httpx_mock, monkeypatch, fetcher, endpoint):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    repo = "testowner/testrepo"
+    url = f"{BASE_API_URL}/repos/{repo}/traffic/{endpoint}"
+    httpx_mock.add_response(
+        url=url,
+        method="GET",
+        status_code=403,
+        text="You have exceeded a secondary rate limit.",
+        headers={"X-RateLimit-Reset": str(int(time.time()) + 5)},
+        is_reusable=True,
+    )
+
+    result = fetcher(repo)
+
+    assert result is None
+    assert len([request for request in httpx_mock.get_requests() if str(request.url) == url]) == 2
+    assert any("Rate limited fetching traffic" in message and repo in message for message in capturing.messages)
+    assert not any("No push access" in message for message in capturing.messages)
+
+
 def test_fetch_traffic_clones(httpx_mock):
     repo = "testowner/testrepo"
     clones_response = {

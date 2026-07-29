@@ -26,6 +26,10 @@ STAR_HEADERS = {"Accept": "application/vnd.github.v3.star+json"}
 MAX_RATE_LIMIT_RETRIES = 5
 
 
+def _is_rate_limited(response: httpx.Response) -> bool:
+    return response.status_code == 403 and "rate limit" in response.text.lower()
+
+
 def _valid_repo_args(values: tuple[str]) -> list[str]:
     """Drop any value that is not in 'owner/repo' form, logging a warning for each."""
     valid = []
@@ -302,7 +306,7 @@ def fetch_traffic_views(repo: str) -> dict | None:
         console.log(f"[red]Request failed fetching views for {repo}: {e}[/]")
         return None
 
-    if response.status_code in (403, 404):
+    if response.status_code in (403, 404) and not _is_rate_limited(response):
         reason = "No push access to" if response.status_code == 403 else "Repository not found:"
         console.log(f"[yellow]{reason} {repo}, skipping traffic data.[/]")
         return None
@@ -314,6 +318,10 @@ def fetch_traffic_views(repo: str) -> dict | None:
         except httpx.RequestError:
             return None
         if response.status_code != 200:
+            if _is_rate_limited(response):
+                console.log(
+                    f"[bold red]Rate limited fetching traffic views for {repo} — skipping (data will be incomplete).[/]"
+                )
             return None
 
     return response.json()
@@ -328,7 +336,7 @@ def fetch_traffic_clones(repo: str) -> dict | None:
         console.log(f"[red]Request failed fetching clones for {repo}: {e}[/]")
         return None
 
-    if response.status_code in (403, 404):
+    if response.status_code in (403, 404) and not _is_rate_limited(response):
         reason = "No push access to" if response.status_code == 403 else "Repository not found:"
         console.log(f"[yellow]{reason} {repo}, skipping clone data.[/]")
         return None
@@ -340,6 +348,11 @@ def fetch_traffic_clones(repo: str) -> dict | None:
         except httpx.RequestError:
             return None
         if response.status_code != 200:
+            if _is_rate_limited(response):
+                console.log(
+                    f"[bold red]Rate limited fetching traffic clones for {repo} — "
+                    "skipping (data will be incomplete).[/]"
+                )
             return None
 
     return response.json()
@@ -354,7 +367,7 @@ def fetch_traffic_referrers(repo: str) -> list | None:
         console.log(f"[red]Request failed fetching referrers for {repo}: {e}[/]")
         return None
 
-    if response.status_code in (403, 404):
+    if response.status_code in (403, 404) and not _is_rate_limited(response):
         reason = "No push access to" if response.status_code == 403 else "Repository not found:"
         console.log(f"[yellow]{reason} {repo}, skipping referrer data.[/]")
         return None
@@ -366,6 +379,11 @@ def fetch_traffic_referrers(repo: str) -> list | None:
         except httpx.RequestError:
             return None
         if response.status_code != 200:
+            if _is_rate_limited(response):
+                console.log(
+                    f"[bold red]Rate limited fetching traffic referrers for {repo} — "
+                    "skipping (data will be incomplete).[/]"
+                )
             return None
 
     return response.json()
