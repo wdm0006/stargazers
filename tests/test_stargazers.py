@@ -16,6 +16,7 @@ from pytest_httpx import HTTPXMock  # Import HTTPXMock for type hinting
 from stargazers.cli import (
     MAX_RATE_LIMIT_RETRIES,
     cli,
+    fetch_contributors,
     fetch_forkers,
     fetch_stargazers,
     fetch_traffic_clones,
@@ -948,6 +949,194 @@ def test_forkers_command(runner, httpx_mock_non_strict_assertion, tmp_path, monk
     assert len(data) == 2
     assert data[0]["login"] == "forkerB"
     assert data[1]["login"] == "forkerA"
+
+
+def test_contributors_command_paginates_enriches_and_sorts(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    httpx_mock = httpx_mock_non_strict_assertion
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    repo = "testowner/testrepo"
+    base_url = f"{BASE_API_URL}/repos/{repo}/contributors"
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page={PER_PAGE}&page=1",
+        method="GET",
+        json=[{"login": "alice", "contributions": 3}],
+        headers={"Link": f'<{base_url}?per_page={PER_PAGE}&page=2>; rel="next"'},
+    )
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page={PER_PAGE}&page=2",
+        method="GET",
+        json=[{"login": "bob", "contributions": 12}],
+    )
+    profiles = {
+        "alice": {
+            "login": "alice",
+            "name": "Alice A",
+            "company": "Acme",
+            "location": "Earth",
+            "email": "alice@example.com",
+            "bio": "Builder",
+            "followers": 4,
+            "public_repos": 7,
+        },
+        "bob": {
+            "login": "bob",
+            "name": "Bob B",
+            "company": None,
+            "location": "Mars",
+            "email": None,
+            "bio": "Maintainer",
+            "followers": 9,
+            "public_repos": 2,
+        },
+    }
+    for login, profile in profiles.items():
+        httpx_mock.add_response(url=f"{BASE_API_URL}/users/{login}", method="GET", json=profile)
+
+    result = runner.invoke(cli, ["contributors", repo], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    output_file = tmp_path / "testowner_testrepo_contributors.csv"
+    assert output_file.exists()
+    with open(output_file, encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        assert reader.fieldnames == [
+            "login",
+            "name",
+            "company",
+            "location",
+            "email",
+            "bio",
+            "followers",
+            "public_repos",
+            "contributions",
+            "repo",
+        ]
+        assert list(reader) == [
+            {
+                "login": "bob",
+                "name": "Bob B",
+                "company": "",
+                "location": "Mars",
+                "email": "",
+                "bio": "Maintainer",
+                "followers": "9",
+                "public_repos": "2",
+                "contributions": "12",
+                "repo": repo,
+            },
+            {
+                "login": "alice",
+                "name": "Alice A",
+                "company": "Acme",
+                "location": "Earth",
+                "email": "alice@example.com",
+                "bio": "Builder",
+                "followers": "4",
+                "public_repos": "7",
+                "contributions": "3",
+                "repo": repo,
+            },
+        ]
+    contributor_requests = [request for request in httpx_mock.get_requests() if "/contributors" in str(request.url)]
+    assert [request.url.params["page"] for request in contributor_requests] == ["1", "2"]
+
+
+def test_contributors_command_empty_repo_writes_no_csv(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.chdir(tmp_path)
+    repo = "testowner/empty"
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/{repo}/contributors?per_page={PER_PAGE}&page=1",
+        method="GET",
+        status_code=204,
+    )
+
+    result = runner.invoke(cli, ["contributors", repo], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert not list(tmp_path.glob("*.csv"))
+    assert any("No contributors found for any repository." in message for message in capturing.messages)
+
+
+def test_fetch_contributors_rate_limit_is_bounded(httpx_mock_non_strict_assertion, monkeypatch):
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    repo = "testowner/testrepo"
+    base_url = f"{BASE_API_URL}/repos/{repo}/contributors"
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page={PER_PAGE}&page=1",
+        method="GET",
+        json=[{"login": "alice", "contributions": 3}],
+        headers={"Link": f'<{base_url}?per_page={PER_PAGE}&page=2>; rel="next"'},
+    )
+    httpx_mock.add_response(
+        url=f"{base_url}?per_page={PER_PAGE}&page=2",
+        method="GET",
+        status_code=403,
+        text="API rate limit exceeded",
+        is_reusable=True,
+    )
+
+    contributors, complete = fetch_contributors(repo)
+
+    assert contributors == [
+        {"login": "alice", "contributions": 3, "user_details": {"login": "alice", "contributions": 3}}
+    ]
+    assert complete is False
+    page_two_requests = [request for request in httpx_mock.get_requests() if request.url.params["page"] == "2"]
+    assert len(page_two_requests) == MAX_RATE_LIMIT_RETRIES + 1
+    assert any(f"WARNING: incomplete data for {repo}" in message for message in capturing.messages)
+
+
+def test_contributors_multiple_repos_and_invalid_argument(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    monkeypatch.chdir(tmp_path)
+    repos = ("owner/one", "owner/two")
+    for index, repo in enumerate(repos, start=1):
+        login = f"user{index}"
+        httpx_mock.add_response(
+            url=f"{BASE_API_URL}/repos/{repo}/contributors?per_page={PER_PAGE}&page=1",
+            method="GET",
+            json=[{"login": login, "contributions": index}],
+        )
+        httpx_mock.add_response(
+            url=f"{BASE_API_URL}/users/{login}",
+            method="GET",
+            json={
+                "login": login,
+                "name": login,
+                "company": None,
+                "location": None,
+                "email": None,
+                "bio": None,
+                "followers": 0,
+                "public_repos": 1,
+            },
+        )
+
+    result = runner.invoke(cli, ["contributors", "invalid", *repos], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    data = read_csv_output(tmp_path / "all_repos_contributors.csv")
+    assert [(row["login"], row["contributions"], row["repo"]) for row in data] == [
+        ("user2", "2", "owner/two"),
+        ("user1", "1", "owner/one"),
+    ]
+    assert any(
+        "Invalid repository format: 'invalid'. Must be 'owner/repo'." in message for message in capturing.messages
+    )
 
 
 @patch("stargazers.cli.plt")

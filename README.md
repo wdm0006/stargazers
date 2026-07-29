@@ -45,6 +45,7 @@ After installation, you can run the CLI from anywhere in your shell using the `s
 
 *   `repos`: Fetches and analyzes stargazers for one or more repositories.
 *   `forkers`: Fetches and analyzes forkers for one or more repositories.
+*   `contributors`: Fetches and analyzes contributors and commit counts for one or more repositories.
 *   `account-trend`: Analyzes star trends over time for all of a user's owned repositories.
 
 ### Analyzing Repository Stargazers
@@ -69,6 +70,12 @@ Example:
 stargazers forkers wdm0006/pygeohash wdm0006/elote
 ```
 
+### Analyzing Repository Contributors
+
+```sh
+stargazers contributors <owner/repo> [<owner/repo> ...]
+```
+
 ### Analyzing User Account Star Trends
 
 To analyze the overall star trend for a user's account, optionally including other specific repositories, excluding some, and displaying a terminal chart:
@@ -91,6 +98,8 @@ stargazers account-trend wdm0006 --include-repo scikit-learn-contrib/category_en
 - For the `repos` subcommand with multiple repos: `all_repos_stargazers.csv`.
 - For the `forkers` subcommand with a single repo: `<owner>_<repo>_forkers.csv`.
 - For the `forkers` subcommand with multiple repos: `all_repos_forkers.csv`.
+- For the `contributors` subcommand with a single repo: `<owner>_<repo>_contributors.csv`.
+- For the `contributors` subcommand with multiple repos: `all_repos_contributors.csv`.
 - For the `account-trend` subcommand: `<username>_account_stars_by_day.csv`.
   This file will contain columns: `star_date`, `new_stars_on_day`, `cumulative_stars_up_to_day`.
 
