@@ -428,6 +428,88 @@ def test_fetch_user_metadata_caps_rate_limit_retries(httpx_mock_non_strict_asser
     assert 60 not in recorded_sleeps
 
 
+GOOD_USER_PROFILE = {
+    "login": "gooduser",
+    "name": "Good User",
+    "company": "GoodCo",
+    "location": "Reykjavik",
+    "email": "good@example.com",
+    "bio": "Still here",
+    "followers": 42,
+    "public_repos": 7,
+}
+
+
+def _two_star_events():
+    return [
+        {"login": "ghostuser", "starred_at": "2023-01-01T00:00:00Z", "user_details": None},
+        {"login": "gooduser", "starred_at": "2023-01-02T00:00:00Z", "user_details": None},
+    ]
+
+
+def _assert_only_good_user(metadata):
+    """The surviving row must carry gooduser's real profile values, not just the right shape."""
+    assert [u["login"] for u in metadata] == ["gooduser"]
+    assert metadata[0]["name"] == "Good User"
+    assert metadata[0]["location"] == "Reykjavik"
+    assert metadata[0]["followers"] == 42
+    assert metadata[0]["public_repos"] == 7
+    assert metadata[0]["starred_at"] == "2023-01-02T00:00:00Z"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body"),
+    [(404, "Not Found"), (500, "Internal Server Error")],
+)
+def test_fetch_user_metadata_skips_unfetchable_user(httpx_mock, recorded_sleeps, status_code, body):
+    """A user whose profile cannot be fetched is skipped; the remaining users are still enriched."""
+    httpx_mock.add_response(
+        url="https://api.github.com/users/ghostuser",
+        method="GET",
+        status_code=status_code,
+        text=body,
+    )
+    httpx_mock.add_response(
+        url="https://api.github.com/users/gooduser",
+        method="GET",
+        json=GOOD_USER_PROFILE,
+        status_code=200,
+    )
+
+    metadata = fetch_user_metadata(_two_star_events())
+
+    _assert_only_good_user(metadata)
+    # The bad user is skipped after a single attempt and the good user is still requested.
+    assert [str(r.url) for r in httpx_mock.get_requests()] == [
+        "https://api.github.com/users/ghostuser",
+        "https://api.github.com/users/gooduser",
+    ]
+
+
+def test_fetch_user_metadata_logs_skipped_count(httpx_mock, monkeypatch):
+    """The number of skipped users is surfaced in a summary log line."""
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    httpx_mock.add_response(
+        url="https://api.github.com/users/ghostuser",
+        method="GET",
+        status_code=404,
+        text="Not Found",
+    )
+    httpx_mock.add_response(
+        url="https://api.github.com/users/gooduser",
+        method="GET",
+        json=GOOD_USER_PROFILE,
+        status_code=200,
+    )
+
+    metadata = fetch_user_metadata(_two_star_events())
+
+    _assert_only_good_user(metadata)
+    assert any("Skipping user ghostuser due to error: 404" in message for message in capturing.messages)
+    assert any("Skipped 1 user(s) whose profile could not be fetched." in message for message in capturing.messages)
+
+
 BASE_API_URL = "https://api.github.com"
 PER_PAGE = 100  # Define for clarity in mock helpers
 
@@ -904,6 +986,47 @@ def test_repos_command_missing_repo_still_exits(runner, httpx_mock_non_strict_as
         f"fetching stargazers for repo {repo_name} not found. Please check the input and try again." in message
         for message in capturing.messages
     )
+
+
+def test_repos_command_skips_stargazer_with_missing_profile(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    """One deleted stargazer account no longer aborts the run — the rest still reach the CSV."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    monkeypatch.chdir(tmp_path)
+    repo_name = "testowner/testrepo"
+
+    mock_stargazers_api(
+        httpx_mock,
+        repo_name,
+        [
+            {"login": "ghostuser", "starred_at": "2023-01-01T00:00:00Z"},
+            {"login": "gooduser", "starred_at": "2023-01-02T00:00:00Z"},
+        ],
+    )
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/users/ghostuser",
+        method="GET",
+        status_code=404,
+        text="Not Found",
+    )
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/users/gooduser",
+        method="GET",
+        json=GOOD_USER_PROFILE,
+        status_code=200,
+    )
+
+    result = runner.invoke(cli, ["repos", repo_name], catch_exceptions=False)
+
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+    output_file = tmp_path / f"{repo_name.replace('/', '_')}_stargazers.csv"
+    assert output_file.exists()
+    data = read_csv_output(output_file)
+    assert [row["login"] for row in data] == ["gooduser"]
+    assert data[0]["location"] == "Reykjavik"
+    assert data[0]["followers"] == "42"
+    assert data[0]["repo"] == repo_name
 
 
 def test_forkers_command(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):

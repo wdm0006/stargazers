@@ -37,12 +37,17 @@ def _valid_repo_args(values: tuple[str]) -> list[str]:
     return valid
 
 
+def _is_rate_limited(response: httpx.Response) -> bool:
+    """True for GitHub's rate-limit rejection: a 403 whose body mentions the rate limit."""
+    return response.status_code == 403 and "rate limit" in response.text.lower()
+
+
 def _handle_api_error(response: httpx.Response, context_message: str):
     """Handles common API errors."""
     if response.status_code == 404:
         console.log(f"[red]{context_message} not found. Please check the input and try again.[/]")
         raise SystemExit(1)
-    if response.status_code == 403 and "rate limit" in response.text.lower():
+    if _is_rate_limited(response):
         console.log(f"[yellow]Rate limit hit. Headers: {response.headers}[/]")
         # Basic wait, more sophisticated backoff might be needed for heavy use
         wait_time = 60
@@ -372,6 +377,7 @@ def fetch_user_metadata(users_info: list, timestamp_key: str | None = "starred_a
     users_info is a list of dicts, each must have 'login' and, when provided, the timestamp_key.
     """
     data = []
+    skipped = 0
     if not users_info:
         console.log("No users to fetch metadata for.")
         return data
@@ -418,11 +424,12 @@ def fetch_user_metadata(users_info: list, timestamp_key: str | None = "starred_a
                 r = httpx.get(user_api_url, headers=HEADERS)
             except httpx.RequestError as e:
                 console.log(f"[red]Request failed for user {username}: {e}[/]")
+                skipped += 1
                 break  # Skip this user on request failure
 
-            error_action = _handle_api_error(r, f"fetching metadata for user {username}")
-            if error_action == "retry":
+            if _is_rate_limited(r):
                 # _handle_api_error already waited out the rate limit before signalling a retry.
+                _handle_api_error(r, f"fetching metadata for user {username}")
                 console.log(f"[yellow]Retrying metadata fetch for user {username}.[/]")
                 retries += 1
                 continue
@@ -448,13 +455,17 @@ def fetch_user_metadata(users_info: list, timestamp_key: str | None = "starred_a
                 data.append(details)
                 time.sleep(0.1)  # Brief pause
                 break
-            # Non-200, non-403 error handled by _handle_api_error or caught here
+            # Any other non-200 (404 for a deleted/renamed account, 5xx, ...) skips just this user.
             console.log(f"[yellow]Skipping user {username} due to error: {r.status_code} - {r.text}[/]")
+            skipped += 1
             break  # Skip this user
         else:  # Loop exited due to max_retries
             console.log(f"[red]Max retries reached for user {username}. Skipping.[/]")
+            skipped += 1
 
     console.log(f"Fetched metadata for {len(data)} users.")
+    if skipped:
+        console.log(f"[yellow]Skipped {skipped} user(s) whose profile could not be fetched.[/]")
     return data
 
 
