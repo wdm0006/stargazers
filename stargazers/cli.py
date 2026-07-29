@@ -225,6 +225,69 @@ def fetch_forkers(repo: str) -> tuple[list, bool]:
     return fork_details, True
 
 
+def fetch_contributors(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]:
+    """Fetch contributors and their commit counts for a repo."""
+    console.log(f"[bold blue]Fetching contributors for:[/] {repo}")
+    url = f"{GITHUB_API}/repos/{repo}/contributors"
+    params = {"per_page": 100, "page": 1}
+    contributor_details = []
+    rate_limit_retries = 0
+
+    while True:
+        console.log(f"Requesting: {url} with params {params}")
+        try:
+            response = httpx.get(url, headers={**HEADERS, **DEFAULT_HEADERS}, params=params)
+        except httpx.RequestError as e:
+            console.log(
+                f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                f"(network error during pagination: {e})[/]"
+            )
+            return contributor_details, False
+
+        if response.status_code == 204:
+            return [], True
+        if skip_missing and response.status_code == 404:
+            console.log(f"[yellow]Repository {repo} not found, skipping contributor data.[/]")
+            return contributor_details, False
+
+        error_action = _handle_api_error(response, f"fetching contributors for repo {repo}")
+        if error_action == "retry":
+            rate_limit_retries += 1
+            if rate_limit_retries > MAX_RATE_LIMIT_RETRIES:
+                console.log(
+                    f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                    f"(still rate limited after {MAX_RATE_LIMIT_RETRIES} retries)[/]"
+                )
+                return contributor_details, False
+            continue
+        rate_limit_retries = 0
+
+        batch = response.json()
+        console.log(f"Fetched {len(batch)} contributors in this batch.")
+        if not batch:
+            break
+
+        contributor_details.extend(
+            [
+                {
+                    "login": contributor["login"],
+                    "contributions": contributor["contributions"],
+                    "user_details": contributor,
+                }
+                for contributor in batch
+            ]
+        )
+
+        if "next" in response.links:
+            params["page"] += 1
+        else:
+            break
+        time.sleep(0.2)
+
+    console.log(f"Total contributors fetched for {repo}: {len(contributor_details)}")
+    return contributor_details, True
+
+
 def fetch_traffic_views(repo: str) -> dict | None:
     """Fetches traffic view data for a repository (last 14 days). Requires push access."""
     url = f"{GITHUB_API}/repos/{repo}/traffic/views"
@@ -303,10 +366,10 @@ def fetch_traffic_referrers(repo: str) -> list | None:
     return response.json()
 
 
-def fetch_user_metadata(users_info: list, timestamp_key: str = "starred_at") -> list:
+def fetch_user_metadata(users_info: list, timestamp_key: str | None = "starred_at") -> list:
     """
     Fetches detailed metadata for a list of users.
-    users_info is a list of dicts, each must have 'login' and the timestamp_key.
+    users_info is a list of dicts, each must have 'login' and, when provided, the timestamp_key.
     """
     data = []
     if not users_info:
@@ -315,7 +378,7 @@ def fetch_user_metadata(users_info: list, timestamp_key: str = "starred_at") -> 
 
     for user_event in track(users_info, description="Fetching user metadata"):
         username = user_event["login"]
-        timestamp_value = user_event[timestamp_key]
+        timestamp_value = user_event[timestamp_key] if timestamp_key is not None else None
 
         # If full user_details are already prefetched (e.g. from stargazers/forks endpoint)
         if user_event.get("user_details"):
@@ -333,8 +396,11 @@ def fetch_user_metadata(users_info: list, timestamp_key: str = "starred_at") -> 
                     "bio": u.get("bio"),
                     "followers": u.get("followers"),
                     "public_repos": u.get("public_repos"),
-                    timestamp_key: timestamp_value,  # Add the original timestamp
                 }
+                if timestamp_key is not None:
+                    details[timestamp_key] = timestamp_value
+                if "contributions" in user_event:
+                    details["contributions"] = user_event["contributions"]
                 if "repo" in user_event:  # Preserve repo if it's there
                     details["repo"] = user_event["repo"]
                 data.append(details)
@@ -372,8 +438,11 @@ def fetch_user_metadata(users_info: list, timestamp_key: str = "starred_at") -> 
                     "bio": u.get("bio"),
                     "followers": u.get("followers"),
                     "public_repos": u.get("public_repos"),
-                    timestamp_key: timestamp_value,
                 }
+                if timestamp_key is not None:
+                    details[timestamp_key] = timestamp_value
+                if "contributions" in user_event:
+                    details["contributions"] = user_event["contributions"]
                 if "repo" in user_event:  # Preserve repo if it's there
                     details["repo"] = user_event["repo"]
                 data.append(details)
@@ -389,13 +458,13 @@ def fetch_user_metadata(users_info: list, timestamp_key: str = "starred_at") -> 
     return data
 
 
-def summarize_and_save(data: list, base_name: str, output_file_suffix: str, timestamp_key: str) -> None:
+def summarize_and_save(data: list, base_name: str, output_file_suffix: str, timestamp_key: str | None) -> None:
     if not data:
         console.log("[yellow]No data to summarize or save.[/]")
         return
 
     df = pd.DataFrame(data)
-    if timestamp_key in df.columns:
+    if timestamp_key is not None and timestamp_key in df.columns:
         df[timestamp_key] = pd.to_datetime(df[timestamp_key])
         df = df.sort_values(timestamp_key, ascending=False)
 
@@ -528,6 +597,40 @@ def forkers_command(ctx, repositories: tuple[str]):
         base_output_name = "all_repos"
 
     summarize_and_save(all_metadata, base_output_name, "forkers", timestamp_key="forked_at")
+
+
+@cli.command("contributors")
+@click.argument("repositories", nargs=-1, required=True)
+@click.pass_context
+def contributors_command(ctx, repositories: tuple[str]):
+    """Fetches and analyzes CONTRIBUTORS for one or more repositories."""
+    console.log(f"Command: 'contributors', Args: {repositories}")
+    all_metadata = []
+    for repo_full_name in repositories:
+        if "/" not in repo_full_name:
+            console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
+            continue
+
+        contributor_events, _complete = fetch_contributors(repo_full_name)
+        for contributor_event in contributor_events:
+            contributor_event["repo"] = repo_full_name
+
+        all_metadata.extend(fetch_user_metadata(contributor_events, timestamp_key=None))
+
+    if not all_metadata:
+        console.log("[yellow]No contributors found for any repository.[/]")
+        return
+
+    all_metadata.sort(key=lambda contributor: contributor["contributions"], reverse=True)
+    base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
+    summarize_and_save(all_metadata, base_output_name, "contributors", timestamp_key=None)
+
+    console.print("\nContributor Summary:")
+    console.print(f"Total contributors: {len(all_metadata)}")
+    console.print(f"Total commits: {sum(contributor['contributions'] for contributor in all_metadata)}")
+    console.print("\nTop Contributors:")
+    for contributor in all_metadata[:10]:
+        console.print(f"{contributor['login']}: {contributor['contributions']} commits")
 
 
 @cli.command("account-trend")
