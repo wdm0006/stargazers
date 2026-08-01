@@ -1,5 +1,7 @@
 import os
 import time
+from collections import Counter
+from datetime import datetime, timezone
 
 import click
 import httpx
@@ -28,6 +30,19 @@ MAX_RATE_LIMIT_RETRIES = 5
 
 def _is_rate_limited(response: httpx.Response) -> bool:
     return response.status_code == 403 and "rate limit" in response.text.lower()
+
+
+def _utcnow() -> datetime:
+    """Current UTC time. A seam so tests can pin 'now' when ageing open issues."""
+    return datetime.now(timezone.utc)
+
+
+def _days_between(start: str | None, end: str | None) -> float | None:
+    """Days (to 2 decimals) between two ISO-8601 timestamps, or None if either is missing."""
+    if not start or not end:
+        return None
+    delta = datetime.fromisoformat(end) - datetime.fromisoformat(start)
+    return round(delta.total_seconds() / 86400, 2)
 
 
 def _valid_repo_args(values: tuple[str]) -> list[str]:
@@ -295,6 +310,81 @@ def fetch_contributors(repo: str, *, skip_missing: bool = False) -> tuple[list, 
 
     console.log(f"Total contributors fetched for {repo}: {len(contributor_details)}")
     return contributor_details, True
+
+
+def fetch_issues(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]:
+    """Fetch issues and pull requests for a repo.
+
+    GitHub's ``/issues`` endpoint returns pull requests mixed in with issues; an item
+    carrying a ``pull_request`` key is a PR. Returns a ``(events, complete)`` tuple with
+    the same partial-data contract as the other paginated fetchers.
+    """
+    console.log(f"[bold blue]Fetching issues for:[/] {repo}")
+    url = f"{GITHUB_API}/repos/{repo}/issues"
+    params = {"state": "all", "per_page": 100, "page": 1}
+    issue_details = []
+    rate_limit_retries = 0
+
+    while True:
+        console.log(f"Requesting: {url} with params {params}")
+        try:
+            response = httpx.get(url, headers={**HEADERS, **DEFAULT_HEADERS}, params=params)
+        except httpx.RequestError as e:
+            console.log(
+                f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                f"(network error during pagination: {e})[/]"
+            )
+            return issue_details, False
+
+        if response.status_code == 410:
+            console.log(f"[yellow]Issues are disabled for {repo}, skipping issue data.[/]")
+            return [], True
+        if skip_missing and response.status_code == 404:
+            console.log(f"[yellow]Repository {repo} not found, skipping issue data.[/]")
+            return issue_details, False
+
+        error_action = _handle_api_error(response, f"fetching issues for repo {repo}")
+        if error_action == "retry":
+            rate_limit_retries += 1
+            if rate_limit_retries > MAX_RATE_LIMIT_RETRIES:
+                console.log(
+                    f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                    f"(still rate limited after {MAX_RATE_LIMIT_RETRIES} retries)[/]"
+                )
+                return issue_details, False
+            continue
+        rate_limit_retries = 0
+
+        batch = response.json()
+        console.log(f"Fetched {len(batch)} issues in this batch.")
+        if not batch:
+            break
+
+        issue_details.extend(
+            [
+                {
+                    "number": item["number"],
+                    "type": "pr" if "pull_request" in item else "issue",
+                    "title": item.get("title"),
+                    "author": (item.get("user") or {}).get("login"),
+                    "state": item.get("state"),
+                    "labels": ", ".join(label["name"] for label in item.get("labels") or []),
+                    "comments": item.get("comments", 0),
+                    "created_at": item.get("created_at"),
+                    "closed_at": item.get("closed_at"),
+                }
+                for item in batch
+            ]
+        )
+
+        if "next" in response.links:
+            params["page"] += 1
+        else:
+            break
+        time.sleep(0.2)
+
+    console.log(f"Total issues and pull requests fetched for {repo}: {len(issue_details)}")
+    return issue_details, True
 
 
 def fetch_traffic_views(repo: str) -> dict | None:
@@ -660,6 +750,64 @@ def contributors_command(ctx, repositories: tuple[str]):
     console.print("\nTop Contributors:")
     for contributor in all_metadata[:10]:
         console.print(f"{contributor['login']}: {contributor['contributions']} commits")
+
+
+def _summarize_issue_engagement(items: list) -> None:
+    """Print open/closed counts by kind, the time-to-close spread, and the busiest authors."""
+    console.print("\nIssue & PR Summary:")
+    for kind, label in (("issue", "Issues"), ("pr", "Pull requests")):
+        of_kind = [item for item in items if item["type"] == kind]
+        open_count = sum(1 for item in of_kind if item["state"] == "open")
+        console.print(f"{label}: {open_count} open, {len(of_kind) - open_count} closed")
+
+    durations = pd.Series([item["days_to_close"] for item in items if item["days_to_close"] is not None])
+    if durations.empty:
+        console.print("Days to close: no closed items")
+    else:
+        console.print(f"Median days to close: {round(float(durations.median()), 2)}")
+        console.print(f"P90 days to close: {round(float(durations.quantile(0.9)), 2)}")
+
+    open_items = [item for item in items if item["state"] == "open" and item["created_at"]]
+    if open_items:
+        oldest = min(open_items, key=lambda item: item["created_at"])
+        age = _days_between(oldest["created_at"], _utcnow().isoformat())
+        console.print(f"Oldest open item: #{oldest['number']} in {oldest['repo']}, opened {age} days ago")
+
+    author_counts = Counter(item["author"] for item in items if item["author"])
+    if author_counts:
+        console.print("\nTop Authors:")
+        for author, count in author_counts.most_common(10):
+            console.print(f"{author}: {count} items")
+
+
+@cli.command("issues")
+@click.argument("repositories", nargs=-1, required=True)
+@click.pass_context
+def issues_command(ctx, repositories: tuple[str]):
+    """Fetches and analyzes ISSUE and PULL REQUEST engagement for one or more repositories."""
+    console.log(f"Command: 'issues', Args: {repositories}")
+    all_items = []
+    for repo_full_name in repositories:
+        if "/" not in repo_full_name:
+            console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
+            continue
+
+        issue_events, _complete = fetch_issues(repo_full_name)
+        for item in issue_events:
+            item["days_to_close"] = _days_between(item["created_at"], item["closed_at"])
+            item["repo"] = repo_full_name
+        all_items.extend(issue_events)
+
+    if not all_items:
+        console.log("[yellow]No issues or pull requests found for any repository.[/]")
+        return
+
+    # ISO-8601 UTC timestamps sort lexicographically, so this is newest-first without
+    # re-typing the column — both timestamps stay exactly as GitHub returned them.
+    all_items.sort(key=lambda item: item["created_at"] or "", reverse=True)
+    base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
+    summarize_and_save(all_items, base_output_name, "issues", timestamp_key=None)
+    _summarize_issue_engagement(all_items)
 
 
 @cli.command("account-trend")
