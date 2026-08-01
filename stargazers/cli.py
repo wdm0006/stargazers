@@ -511,8 +511,9 @@ def summarize_and_save(data: list, base_name: str, output_file_suffix: str, time
         console.print("\nStar Trend Summary:")
         console.print(f"Date range: {df['star_date'].min()} to {df['star_date'].max()}")
         console.print(f"Total new stars in period: {df['total_new_stars_on_day'].sum()}")
+        # Rows are sorted newest first, so the newest day is at .iloc[0].
         console.print(
-            f"Final cumulative stars: {df['total_cumulative_stars_up_to_day'].iloc[-1] if not df.empty else 0}"
+            f"Final cumulative stars: {df['total_cumulative_stars_up_to_day'].iloc[0] if not df.empty else 0}"
         )
 
         # Print per-repository summaries
@@ -520,7 +521,8 @@ def summarize_and_save(data: list, base_name: str, output_file_suffix: str, time
         if repo_columns:
             console.print("\nPer-Repository Summary:")
             for col in repo_columns:
-                repo_name = col[:-10].replace("_", "/")  # Remove '_new_stars' and restore '/'
+                # Remove '_new_stars'; only the first underscore is the owner/repo separator.
+                repo_name = col[:-10].replace("_", "/", 1)
                 cumul_col = f"{col[:-10]}_cumulative_stars"
                 final_stars = df[cumul_col].iloc[0] if not df.empty else 0
                 console.print(f"{repo_name}: {final_stars} total stars")

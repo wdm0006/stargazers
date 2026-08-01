@@ -912,6 +912,80 @@ def test_summarize_and_save_account_trend(tmp_path, monkeypatch):
     assert data[1]["cumulative_stars_up_to_day"] == "2"  # Asserting string value
 
 
+@pytest.fixture
+def underscore_repo_trend_data():
+    """Three days of stars for one repo whose name contains an underscore.
+
+    The first day's cumulative total (2) differs from the final one (9), so an
+    assertion on the printed final total distinguishes the newest row from the oldest.
+    """
+    return [
+        {
+            "star_date": "2023-01-01",
+            "total_new_stars_on_day": 2,
+            "total_cumulative_stars_up_to_day": 2,
+            "wdm0006_my_repo_new_stars": 2,
+            "wdm0006_my_repo_cumulative_stars": 2,
+        },
+        {
+            "star_date": "2023-01-02",
+            "total_new_stars_on_day": 3,
+            "total_cumulative_stars_up_to_day": 5,
+            "wdm0006_my_repo_new_stars": 3,
+            "wdm0006_my_repo_cumulative_stars": 5,
+        },
+        {
+            "star_date": "2023-01-03",
+            "total_new_stars_on_day": 4,
+            "total_cumulative_stars_up_to_day": 9,
+            "wdm0006_my_repo_new_stars": 4,
+            "wdm0006_my_repo_cumulative_stars": 9,
+        },
+    ]
+
+
+def test_trend_summary_prints_newest_cumulative_total(tmp_path, monkeypatch, underscore_repo_trend_data):
+    """The 'Final cumulative stars' line reports the newest day, not the oldest."""
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    summarize_and_save(underscore_repo_trend_data, "testuser", "account_stars_by_day", timestamp_key="star_date")
+
+    assert "Total new stars in period: 9" in capturing.messages
+    assert "Final cumulative stars: 9" in capturing.messages
+    assert "Final cumulative stars: 2" not in capturing.messages
+
+
+def test_trend_summary_preserves_underscores_in_repo_names(tmp_path, monkeypatch, underscore_repo_trend_data):
+    """Only the first underscore of a repo column prefix is the owner/repo separator."""
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    summarize_and_save(underscore_repo_trend_data, "testuser", "account_stars_by_day", timestamp_key="star_date")
+
+    assert "wdm0006/my_repo: 9 total stars" in capturing.messages
+    assert "wdm0006/my/repo: 9 total stars" not in capturing.messages
+
+
+def test_trend_summary_csv_columns_unchanged(tmp_path, monkeypatch, underscore_repo_trend_data):
+    """The saved CSV keeps its original column names and values."""
+    monkeypatch.chdir(tmp_path)
+
+    summarize_and_save(underscore_repo_trend_data, "testuser", "account_stars_by_day", timestamp_key="star_date")
+
+    data = read_csv_output(tmp_path / "testuser_account_stars_by_day.csv")
+    assert list(data[0].keys()) == [
+        "star_date",
+        "total_new_stars_on_day",
+        "total_cumulative_stars_up_to_day",
+        "wdm0006_my_repo_new_stars",
+        "wdm0006_my_repo_cumulative_stars",
+    ]
+    assert [row["total_cumulative_stars_up_to_day"] for row in data] == ["9", "5", "2"]
+
+
 def test_repos_command(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch, sample_stargazer_data):
     httpx_mock = httpx_mock_non_strict_assertion  # Use the yielded mock
     monkeypatch.chdir(tmp_path)
