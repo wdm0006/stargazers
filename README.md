@@ -46,6 +46,7 @@ After installation, you can run the CLI from anywhere in your shell using the `s
 *   `repos`: Fetches and analyzes stargazers for one or more repositories.
 *   `forkers`: Fetches and analyzes forkers for one or more repositories.
 *   `contributors`: Fetches and analyzes contributors and commit counts for one or more repositories.
+*   `issues`: Fetches and analyzes issue and pull-request engagement for one or more repositories.
 *   `account-trend`: Analyzes star trends over time for all of a user's owned repositories.
 
 ### Analyzing Repository Stargazers
@@ -76,6 +77,26 @@ stargazers forkers wdm0006/pygeohash wdm0006/elote
 stargazers contributors <owner/repo> [<owner/repo> ...]
 ```
 
+### Analyzing Issue and Pull Request Engagement
+
+```sh
+stargazers issues <owner/repo> [<owner/repo> ...]
+```
+
+GitHub's `/issues` endpoint returns pull requests alongside issues, so every row is labelled
+`type=issue` or `type=pr`. Each row carries `number`, `type`, `title`, `author`, `state`, `labels`,
+`comments`, `created_at`, `closed_at`, `days_to_close` (blank while an item is still open), and
+`repo`. The printed summary breaks open/closed counts down by issues vs. pull requests, reports the
+median and p90 time to close, the age of the oldest open item, and the top authors by item count.
+
+This command makes no per-user profile calls, so a repository costs one request per 100 items.
+Repositories with issues disabled are skipped with a message rather than aborting the run.
+
+Example:
+```sh
+stargazers issues wdm0006/pygeohash wdm0006/elote
+```
+
 ### Analyzing User Account Star Trends
 
 To analyze the overall star trend for a user's account, optionally including other specific repositories, excluding some, and displaying a terminal chart:
@@ -100,6 +121,8 @@ stargazers account-trend wdm0006 --include-repo scikit-learn-contrib/category_en
 - For the `forkers` subcommand with multiple repos: `all_repos_forkers.csv`.
 - For the `contributors` subcommand with a single repo: `<owner>_<repo>_contributors.csv`.
 - For the `contributors` subcommand with multiple repos: `all_repos_contributors.csv`.
+- For the `issues` subcommand with a single repo: `<owner>_<repo>_issues.csv`.
+- For the `issues` subcommand with multiple repos: `all_repos_issues.csv`.
 - For the `account-trend` subcommand: `<username>_account_stars_by_day.csv`.
   This file will contain columns: `star_date`, `new_stars_on_day`, `cumulative_stars_up_to_day`.
 

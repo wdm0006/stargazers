@@ -2,6 +2,7 @@ import csv
 import os
 import sys
 import time
+from datetime import datetime, timezone
 
 import httpx
 import pandas as pd
@@ -18,6 +19,7 @@ from stargazers.cli import (
     cli,
     fetch_contributors,
     fetch_forkers,
+    fetch_issues,
     fetch_stargazers,
     fetch_traffic_clones,
     fetch_traffic_referrers,
@@ -1334,6 +1336,243 @@ def test_contributors_multiple_repos_and_invalid_argument(
     assert any(
         "Invalid repository format: 'invalid'. Must be 'owner/repo'." in message for message in capturing.messages
     )
+
+
+ISSUES_BASE_PARAMS = f"state=all&per_page={PER_PAGE}"
+
+
+def _issue_payload(
+    number,
+    *,
+    created_at,
+    is_pr=False,
+    state="closed",
+    closed_at=None,
+    author="alice",
+    comments=0,
+    labels=(),
+):
+    """Build a single item exactly as GitHub's /issues list endpoint returns it."""
+    item = {
+        "number": number,
+        "title": f"Item {number}",
+        "state": state,
+        "comments": comments,
+        "created_at": created_at,
+        "closed_at": closed_at,
+        "user": {"login": author},
+        "labels": [{"name": name} for name in labels],
+    }
+    if is_pr:
+        # Present ONLY on pull requests — this key is what distinguishes them.
+        item["pull_request"] = {"url": f"https://api.github.com/repos/x/y/pulls/{number}"}
+    return item
+
+
+def test_issues_command_types_pagination_and_time_to_close(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    """Two pages of mixed issues/PRs land in one CSV with exact types and days_to_close."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("stargazers.cli._utcnow", lambda: datetime(2024, 1, 21, tzinfo=timezone.utc))
+    monkeypatch.chdir(tmp_path)
+    repo = "testowner/testrepo"
+    base_url = f"{BASE_API_URL}/repos/{repo}/issues"
+
+    httpx_mock.add_response(
+        url=f"{base_url}?{ISSUES_BASE_PARAMS}&page=1",
+        method="GET",
+        json=[
+            _issue_payload(
+                4,
+                created_at="2024-01-01T00:00:00Z",
+                state="open",
+                comments=5,
+                labels=("bug", "help wanted"),
+            ),
+            _issue_payload(
+                3,
+                created_at="2024-01-02T00:00:00Z",
+                closed_at="2024-01-03T00:00:00Z",
+                is_pr=True,
+                author="bob",
+                comments=2,
+            ),
+        ],
+        headers={"Link": f'<{base_url}?{ISSUES_BASE_PARAMS}&page=2>; rel="next"'},
+    )
+    httpx_mock.add_response(
+        url=f"{base_url}?{ISSUES_BASE_PARAMS}&page=2",
+        method="GET",
+        json=[
+            _issue_payload(2, created_at="2024-01-05T00:00:00Z", closed_at="2024-01-07T12:00:00Z"),
+            _issue_payload(1, created_at="2024-01-10T00:00:00Z", closed_at="2024-01-16T00:00:00Z", is_pr=True),
+        ],
+    )
+
+    result = runner.invoke(cli, ["issues", repo], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    output_file = tmp_path / "testowner_testrepo_issues.csv"
+    assert output_file.exists()
+    with open(output_file, encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        assert reader.fieldnames == [
+            "number",
+            "type",
+            "title",
+            "author",
+            "state",
+            "labels",
+            "comments",
+            "created_at",
+            "closed_at",
+            "days_to_close",
+            "repo",
+        ]
+        rows = list(reader)
+
+    # Newest-first by created_at, with per-row type driven by the `pull_request` key.
+    assert [(row["number"], row["type"]) for row in rows] == [("1", "pr"), ("2", "issue"), ("3", "pr"), ("4", "issue")]
+    # Exact durations: 6 days, 2.5 days, 1 day, and blank for the still-open item.
+    assert [row["days_to_close"] for row in rows] == ["6.0", "2.5", "1.0", ""]
+    assert [row["created_at"] for row in rows] == [
+        "2024-01-10T00:00:00Z",
+        "2024-01-05T00:00:00Z",
+        "2024-01-02T00:00:00Z",
+        "2024-01-01T00:00:00Z",
+    ]
+    assert [row["closed_at"] for row in rows] == [
+        "2024-01-16T00:00:00Z",
+        "2024-01-07T12:00:00Z",
+        "2024-01-03T00:00:00Z",
+        "",
+    ]
+    assert [row["author"] for row in rows] == ["alice", "alice", "bob", "alice"]
+    assert [row["comments"] for row in rows] == ["0", "0", "2", "5"]
+    assert [row["labels"] for row in rows] == ["", "", "", "bug, help wanted"]
+    assert {row["repo"] for row in rows} == {repo}
+
+    # Both pages were requested, in order.
+    issue_requests = [request for request in httpx_mock.get_requests() if "/issues" in str(request.url)]
+    assert [request.url.params["page"] for request in issue_requests] == ["1", "2"]
+    assert [request.url.params["state"] for request in issue_requests] == ["all", "all"]
+
+    # Summary values: median of [1.0, 2.5, 6.0] is 2.5; p90 (linear) is 5.3.
+    assert "Issues: 1 open, 1 closed" in capturing.messages
+    assert "Pull requests: 0 open, 2 closed" in capturing.messages
+    assert "Median days to close: 2.5" in capturing.messages
+    assert "P90 days to close: 5.3" in capturing.messages
+    assert f"Oldest open item: #4 in {repo}, opened 20.0 days ago" in capturing.messages
+    assert "alice: 3 items" in capturing.messages
+    assert "bob: 1 items" in capturing.messages
+
+
+def test_issues_command_multiple_repos_and_invalid_argument(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.chdir(tmp_path)
+    repos = ("owner/one", "owner/two")
+    for index, repo in enumerate(repos, start=1):
+        httpx_mock.add_response(
+            url=f"{BASE_API_URL}/repos/{repo}/issues?{ISSUES_BASE_PARAMS}&page=1",
+            method="GET",
+            json=[
+                _issue_payload(
+                    index,
+                    created_at=f"2024-02-0{index}T00:00:00Z",
+                    closed_at=f"2024-02-0{index + 1}T00:00:00Z",
+                    author=f"user{index}",
+                )
+            ],
+        )
+
+    result = runner.invoke(cli, ["issues", "invalid", *repos], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert not (tmp_path / "owner_one_issues.csv").exists()
+    rows = read_csv_output(tmp_path / "all_repos_issues.csv")
+    assert [(row["number"], row["repo"], row["days_to_close"]) for row in rows] == [
+        ("2", "owner/two", "1.0"),
+        ("1", "owner/one", "1.0"),
+    ]
+    assert any(
+        "Invalid repository format: 'invalid'. Must be 'owner/repo'." in message for message in capturing.messages
+    )
+
+
+def test_issues_command_skips_repo_with_issues_disabled(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    """A 410 Gone for one repository is skipped, and the other repository still lands in the CSV."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.chdir(tmp_path)
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/owner/disabled/issues?{ISSUES_BASE_PARAMS}&page=1",
+        method="GET",
+        status_code=410,
+        text="Issues are disabled for this repo",
+    )
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/owner/enabled/issues?{ISSUES_BASE_PARAMS}&page=1",
+        method="GET",
+        json=[_issue_payload(7, created_at="2024-03-01T00:00:00Z", state="open")],
+    )
+
+    result = runner.invoke(cli, ["issues", "owner/disabled", "owner/enabled"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert any("Issues are disabled for owner/disabled" in message for message in capturing.messages)
+    rows = read_csv_output(tmp_path / "all_repos_issues.csv")
+    assert [(row["number"], row["repo"]) for row in rows] == [("7", "owner/enabled")]
+
+
+def test_fetch_issues_rate_limit_is_bounded(httpx_mock_non_strict_assertion, monkeypatch, no_sleep):
+    """A persistent rate-limit 403 returns page-1 data flagged incomplete after the retry cap."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    repo = "testowner/testrepo"
+    base_url = f"{BASE_API_URL}/repos/{repo}/issues"
+    httpx_mock.add_response(
+        url=f"{base_url}?{ISSUES_BASE_PARAMS}&page=1",
+        method="GET",
+        json=[_issue_payload(1, created_at="2024-01-01T00:00:00Z", state="open")],
+        headers={"Link": f'<{base_url}?{ISSUES_BASE_PARAMS}&page=2>; rel="next"'},
+    )
+    httpx_mock.add_response(
+        url=f"{base_url}?{ISSUES_BASE_PARAMS}&page=2",
+        method="GET",
+        status_code=403,
+        text="API rate limit exceeded",
+        is_reusable=True,
+    )
+
+    items, complete = fetch_issues(repo)
+
+    assert complete is False
+    assert items == [
+        {
+            "number": 1,
+            "type": "issue",
+            "title": "Item 1",
+            "author": "alice",
+            "state": "open",
+            "labels": "",
+            "comments": 0,
+            "created_at": "2024-01-01T00:00:00Z",
+            "closed_at": None,
+        }
+    ]
+    page_two_requests = [request for request in httpx_mock.get_requests() if request.url.params["page"] == "2"]
+    assert len(page_two_requests) == MAX_RATE_LIMIT_RETRIES + 1
+    assert any(f"WARNING: incomplete data for {repo}" in message for message in capturing.messages)
 
 
 @patch("stargazers.cli.plt")
