@@ -20,6 +20,7 @@ from stargazers.cli import (
     fetch_contributors,
     fetch_forkers,
     fetch_issues,
+    fetch_releases,
     fetch_stargazers,
     fetch_traffic_clones,
     fetch_traffic_referrers,
@@ -1573,6 +1574,222 @@ def test_fetch_issues_rate_limit_is_bounded(httpx_mock_non_strict_assertion, mon
     page_two_requests = [request for request in httpx_mock.get_requests() if request.url.params["page"] == "2"]
     assert len(page_two_requests) == MAX_RATE_LIMIT_RETRIES + 1
     assert any(f"WARNING: incomplete data for {repo}" in message for message in capturing.messages)
+
+
+RELEASES_BASE_PARAMS = f"per_page={PER_PAGE}"
+
+
+def _release_payload(tag, *, published_at, downloads=(), author="alice", draft=False, prerelease=False):
+    """Build a single release exactly as GitHub's /releases list endpoint returns it."""
+    return {
+        "tag_name": tag,
+        "name": f"Release {tag}",
+        "draft": draft,
+        "prerelease": prerelease,
+        "created_at": published_at,
+        "published_at": published_at,
+        "author": {"login": author},
+        "assets": [
+            {"name": f"{tag}-asset-{index}.whl", "size": 100, "download_count": count}
+            for index, count in enumerate(downloads)
+        ],
+    }
+
+
+def test_releases_command_downloads_assets_and_cadence(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    """Two pages of releases land in one CSV with exact download sums, asset counts and gaps."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    monkeypatch.chdir(tmp_path)
+    repo = "testowner/testrepo"
+    base_url = f"{BASE_API_URL}/repos/{repo}/releases"
+
+    # GitHub returns releases newest first.
+    httpx_mock.add_response(
+        url=f"{base_url}?{RELEASES_BASE_PARAMS}&page=1",
+        method="GET",
+        json=[
+            _release_payload("v4", published_at="2024-03-11T00:00:00Z", downloads=(5, 7)),
+            _release_payload("v3", published_at="2024-03-01T00:00:00Z", downloads=(100,), author="bob"),
+        ],
+        headers={"Link": f'<{base_url}?{RELEASES_BASE_PARAMS}&page=2>; rel="next"'},
+    )
+    httpx_mock.add_response(
+        url=f"{base_url}?{RELEASES_BASE_PARAMS}&page=2",
+        method="GET",
+        json=[
+            _release_payload("v2", published_at="2024-02-10T12:00:00Z", downloads=(1, 2, 3), prerelease=True),
+            _release_payload("v1", published_at="2024-01-31T12:00:00Z"),
+        ],
+    )
+
+    result = runner.invoke(cli, ["releases", repo], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    output_file = tmp_path / "testowner_testrepo_releases.csv"
+    assert output_file.exists()
+    with open(output_file, encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        assert reader.fieldnames == [
+            "tag_name",
+            "name",
+            "author",
+            "draft",
+            "prerelease",
+            "created_at",
+            "published_at",
+            "days_since_previous",
+            "assets",
+            "downloads",
+            "repo",
+        ]
+        rows = list(reader)
+
+    assert [row["tag_name"] for row in rows] == ["v4", "v3", "v2", "v1"]
+    # downloads is the SUM across a release's assets; assets is the count.
+    assert [row["downloads"] for row in rows] == ["12", "100", "6", "0"]
+    assert [row["assets"] for row in rows] == ["2", "1", "3", "0"]
+    # Hand-computed gaps: 2024-03-01 -> 03-11 is 10 days; 02-10T12:00 -> 03-01T00:00 is
+    # 19.5 (2024 is a leap year); 01-31T12:00 -> 02-10T12:00 is 10. The oldest has none.
+    assert [row["days_since_previous"] for row in rows] == ["10.0", "19.5", "10.0", ""]
+    assert [row["published_at"] for row in rows] == [
+        "2024-03-11T00:00:00Z",
+        "2024-03-01T00:00:00Z",
+        "2024-02-10T12:00:00Z",
+        "2024-01-31T12:00:00Z",
+    ]
+    assert [row["author"] for row in rows] == ["alice", "bob", "alice", "alice"]
+    assert [row["prerelease"] for row in rows] == ["False", "False", "True", "False"]
+    assert {row["repo"] for row in rows} == {repo}
+    assert {row["name"] for row in rows} == {"Release v1", "Release v2", "Release v3", "Release v4"}
+
+    release_requests = [request for request in httpx_mock.get_requests() if "/releases" in str(request.url)]
+    assert [request.url.params["page"] for request in release_requests] == ["1", "2"]
+
+    assert "Total releases: 4" in capturing.messages
+    assert "Total downloads: 118" in capturing.messages
+    # Median of [10.0, 19.5, 10.0].
+    assert "Median days between releases: 10.0" in capturing.messages
+    assert "Latest release: 2024-03-11T00:00:00Z" in capturing.messages
+    assert f"{repo} v3: 100 downloads" in capturing.messages
+    assert f"{repo} v4: 12 downloads" in capturing.messages
+
+
+def test_releases_command_cadence_is_per_repository(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    """Two repositories whose releases interleave in time keep separate cadences.
+
+    A globally-sorted list would yield 5.0/5.0/10.0 with a single blank; per repository the
+    gaps are 10.0 and 15.0 with a blank for each repository's own oldest release.
+    """
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.chdir(tmp_path)
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/owner/one/releases?{RELEASES_BASE_PARAMS}&page=1",
+        method="GET",
+        json=[
+            _release_payload("one-b", published_at="2024-01-11T00:00:00Z", downloads=(4,)),
+            _release_payload("one-a", published_at="2024-01-01T00:00:00Z"),
+        ],
+    )
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/owner/two/releases?{RELEASES_BASE_PARAMS}&page=1",
+        method="GET",
+        json=[
+            _release_payload("two-b", published_at="2024-01-21T00:00:00Z"),
+            _release_payload("two-a", published_at="2024-01-06T00:00:00Z"),
+        ],
+    )
+
+    result = runner.invoke(cli, ["releases", "invalid", "owner/one", "owner/two"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert not (tmp_path / "owner_one_releases.csv").exists()
+    rows = read_csv_output(tmp_path / "all_repos_releases.csv")
+    assert [(row["tag_name"], row["repo"], row["days_since_previous"]) for row in rows] == [
+        ("two-b", "owner/two", "15.0"),
+        ("one-b", "owner/one", "10.0"),
+        ("two-a", "owner/two", ""),
+        ("one-a", "owner/one", ""),
+    ]
+    # An argument without a slash is skipped and the run continues.
+    assert any(
+        "Invalid repository format: 'invalid'. Must be 'owner/repo'." in message for message in capturing.messages
+    )
+
+
+def test_releases_command_repo_with_no_releases_writes_nothing(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    """GitHub answers 200 with an empty array — that must log a message, not error."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.chdir(tmp_path)
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/owner/quiet/releases?{RELEASES_BASE_PARAMS}&page=1",
+        method="GET",
+        json=[],
+    )
+
+    result = runner.invoke(cli, ["releases", "owner/quiet"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert list(tmp_path.glob("*.csv")) == []
+    assert any("No releases found for any repository." in message for message in capturing.messages)
+
+
+def test_fetch_releases_rate_limit_is_bounded(httpx_mock_non_strict_assertion, monkeypatch, no_sleep):
+    """A persistent rate-limit 403 returns page-1 data flagged incomplete after the retry cap."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    repo = "testowner/testrepo"
+    base_url = f"{BASE_API_URL}/repos/{repo}/releases"
+    httpx_mock.add_response(
+        url=f"{base_url}?{RELEASES_BASE_PARAMS}&page=1",
+        method="GET",
+        json=[_release_payload("v1", published_at="2024-01-01T00:00:00Z", downloads=(3, 4))],
+        headers={"Link": f'<{base_url}?{RELEASES_BASE_PARAMS}&page=2>; rel="next"'},
+    )
+    httpx_mock.add_response(
+        url=f"{base_url}?{RELEASES_BASE_PARAMS}&page=2",
+        method="GET",
+        status_code=403,
+        text="API rate limit exceeded",
+        is_reusable=True,
+    )
+
+    items, complete = fetch_releases(repo)
+
+    assert complete is False
+    assert items == [
+        {
+            "tag_name": "v1",
+            "name": "Release v1",
+            "author": "alice",
+            "draft": False,
+            "prerelease": False,
+            "created_at": "2024-01-01T00:00:00Z",
+            "published_at": "2024-01-01T00:00:00Z",
+            "days_since_previous": None,
+            "assets": 2,
+            "downloads": 7,
+        }
+    ]
+    page_two_requests = [request for request in httpx_mock.get_requests() if request.url.params["page"] == "2"]
+    assert len(page_two_requests) == MAX_RATE_LIMIT_RETRIES + 1
+    assert any(f"WARNING: incomplete data for {repo}" in message for message in capturing.messages)
+
+
+def test_cli_help_lists_releases_command(runner):
+    result = runner.invoke(cli, ["--help"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert "releases" in result.output
 
 
 @patch("stargazers.cli.plt")

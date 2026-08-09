@@ -387,6 +387,81 @@ def fetch_issues(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]:
     return issue_details, True
 
 
+def fetch_releases(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]:
+    """Fetch releases for a repo, with per-release asset counts and download totals.
+
+    The list payload already carries the author login and every asset's ``download_count``,
+    so no per-person follow-up call is needed. Returns a ``(events, complete)`` tuple with
+    the same partial-data contract as the other paginated fetchers.
+    """
+    console.log(f"[bold blue]Fetching releases for:[/] {repo}")
+    url = f"{GITHUB_API}/repos/{repo}/releases"
+    params = {"per_page": 100, "page": 1}
+    release_details = []
+    rate_limit_retries = 0
+
+    while True:
+        console.log(f"Requesting: {url} with params {params}")
+        try:
+            response = httpx.get(url, headers={**HEADERS, **DEFAULT_HEADERS}, params=params)
+        except httpx.RequestError as e:
+            console.log(
+                f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                f"(network error during pagination: {e})[/]"
+            )
+            return release_details, False
+
+        if skip_missing and response.status_code == 404:
+            console.log(f"[yellow]Repository {repo} not found, skipping release data.[/]")
+            return release_details, False
+
+        error_action = _handle_api_error(response, f"fetching releases for repo {repo}")
+        if error_action == "retry":
+            rate_limit_retries += 1
+            if rate_limit_retries > MAX_RATE_LIMIT_RETRIES:
+                console.log(
+                    f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                    f"(still rate limited after {MAX_RATE_LIMIT_RETRIES} retries)[/]"
+                )
+                return release_details, False
+            continue
+        rate_limit_retries = 0
+
+        batch = response.json()
+        console.log(f"Fetched {len(batch)} releases in this batch.")
+        if not batch:
+            break
+
+        release_details.extend(
+            [
+                {
+                    "tag_name": item.get("tag_name"),
+                    "name": item.get("name"),
+                    "author": (item.get("author") or {}).get("login"),
+                    "draft": item.get("draft", False),
+                    "prerelease": item.get("prerelease", False),
+                    "created_at": item.get("created_at"),
+                    "published_at": item.get("published_at"),
+                    # Declared here so the CSV column order is fixed; filled per repository
+                    # by the caller, which is what keeps the cadence from spanning repos.
+                    "days_since_previous": None,
+                    "assets": len(item.get("assets") or []),
+                    "downloads": sum(asset.get("download_count", 0) for asset in item.get("assets") or []),
+                }
+                for item in batch
+            ]
+        )
+
+        if "next" in response.links:
+            params["page"] += 1
+        else:
+            break
+        time.sleep(0.2)
+
+    console.log(f"Total releases fetched for {repo}: {len(release_details)}")
+    return release_details, True
+
+
 def fetch_traffic_views(repo: str) -> dict | None:
     """Fetches traffic view data for a repository (last 14 days). Requires push access."""
     url = f"{GITHUB_API}/repos/{repo}/traffic/views"
@@ -810,6 +885,72 @@ def issues_command(ctx, repositories: tuple[str]):
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
     summarize_and_save(all_items, base_output_name, "issues", timestamp_key=None)
     _summarize_issue_engagement(all_items)
+
+
+def _apply_days_since_previous(releases: list) -> None:
+    """Set ``days_since_previous`` on each release, measured against the previous release in this list.
+
+    Callers pass one repository's releases at a time, so cadence never spans repositories.
+    """
+    previous_published = None
+    for item in sorted(releases, key=lambda release: release["published_at"] or ""):
+        item["days_since_previous"] = _days_between(previous_published, item["published_at"])
+        if item["published_at"]:
+            previous_published = item["published_at"]
+
+
+def _summarize_release_cadence(items: list) -> None:
+    """Print release totals, how often releases ship, and the most-downloaded releases."""
+    console.print("\nRelease Summary:")
+    console.print(f"Total releases: {len(items)}")
+    console.print(f"Total downloads: {sum(item['downloads'] for item in items)}")
+
+    gaps = pd.Series([item["days_since_previous"] for item in items if item["days_since_previous"] is not None])
+    if gaps.empty:
+        console.print("Days between releases: not enough releases")
+    else:
+        console.print(f"Median days between releases: {round(float(gaps.median()), 2)}")
+
+    published = [item["published_at"] for item in items if item["published_at"]]
+    if published:
+        console.print(f"Latest release: {max(published)}")
+
+    ranked = [item for item in sorted(items, key=lambda item: item["downloads"], reverse=True) if item["downloads"]]
+    if ranked:
+        console.print("\nMost Downloaded Releases:")
+        for item in ranked[:10]:
+            console.print(f"{item['repo']} {item['tag_name']}: {item['downloads']} downloads")
+
+
+@cli.command("releases")
+@click.argument("repositories", nargs=-1, required=True)
+@click.pass_context
+def releases_command(ctx, repositories: tuple[str]):
+    """Fetches and analyzes RELEASE cadence and asset downloads for one or more repositories."""
+    console.log(f"Command: 'releases', Args: {repositories}")
+    all_items = []
+    for repo_full_name in repositories:
+        if "/" not in repo_full_name:
+            console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
+            continue
+
+        release_events, _complete = fetch_releases(repo_full_name)
+        # Per repository, before these events join the shared list.
+        _apply_days_since_previous(release_events)
+        for item in release_events:
+            item["repo"] = repo_full_name
+        all_items.extend(release_events)
+
+    if not all_items:
+        console.log("[yellow]No releases found for any repository.[/]")
+        return
+
+    # ISO-8601 UTC timestamps sort lexicographically, so this is newest-first without
+    # re-typing the column — both timestamps stay exactly as GitHub returned them.
+    all_items.sort(key=lambda item: item["published_at"] or "", reverse=True)
+    base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
+    summarize_and_save(all_items, base_output_name, "releases", timestamp_key=None)
+    _summarize_release_cadence(all_items)
 
 
 @cli.command("account-trend")
