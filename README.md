@@ -47,6 +47,7 @@ After installation, you can run the CLI from anywhere in your shell using the `s
 *   `forkers`: Fetches and analyzes forkers for one or more repositories.
 *   `contributors`: Fetches and analyzes contributors and commit counts for one or more repositories.
 *   `issues`: Fetches and analyzes issue and pull-request engagement for one or more repositories.
+*   `releases`: Fetches release cadence and per-release asset download counts for one or more repositories.
 *   `account-trend`: Analyzes star trends over time for all of a user's owned repositories.
 
 ### Analyzing Repository Stargazers
@@ -97,6 +98,29 @@ Example:
 stargazers issues wdm0006/pygeohash wdm0006/elote
 ```
 
+### Analyzing Release Cadence and Downloads
+
+```sh
+stargazers releases <owner/repo> [<owner/repo> ...]
+```
+
+GitHub exposes an asset's `download_count` in the API but never totals it anywhere in the UI. Each
+row carries `tag_name`, `name`, `author`, `draft`, `prerelease`, `created_at`, `published_at`,
+`days_since_previous` (blank for a repository's oldest release), `assets` (the asset count),
+`downloads` (the sum of `download_count` across that release's assets), and `repo`. Rows are sorted
+newest first by `published_at`, and `days_since_previous` is always measured against the previous
+release of the *same* repository, so a multi-repository run keeps each project's cadence separate.
+The printed summary reports the total releases and downloads, the median days between releases, the
+date of the latest release, and the ten most-downloaded releases.
+
+This command makes no per-user profile calls, so a repository costs one request per 100 releases. A
+repository with no releases writes no CSV and says so rather than erroring.
+
+Example:
+```sh
+stargazers releases wdm0006/pygeohash wdm0006/elote
+```
+
 ### Analyzing User Account Star Trends
 
 To analyze the overall star trend for a user's account, optionally including other specific repositories, excluding some, and displaying a terminal chart:
@@ -123,6 +147,8 @@ stargazers account-trend wdm0006 --include-repo scikit-learn-contrib/category_en
 - For the `contributors` subcommand with multiple repos: `all_repos_contributors.csv`.
 - For the `issues` subcommand with a single repo: `<owner>_<repo>_issues.csv`.
 - For the `issues` subcommand with multiple repos: `all_repos_issues.csv`.
+- For the `releases` subcommand with a single repo: `<owner>_<repo>_releases.csv`.
+- For the `releases` subcommand with multiple repos: `all_repos_releases.csv`.
 - For the `account-trend` subcommand: `<username>_account_stars_by_day.csv`.
   This file will contain columns: `star_date`, `new_stars_on_day`, `cumulative_stars_up_to_day`.
 
