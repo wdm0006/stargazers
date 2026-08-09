@@ -119,7 +119,7 @@ def fetch_user_repos(username: str) -> list[str]:
         if not batch:
             break
 
-        repos.extend([repo["full_name"] for repo in batch if repo["owner"]["login"] == username])
+        repos.extend([repo["full_name"] for repo in batch if repo["owner"]["login"].lower() == username.lower()])
         console.log(f"Fetched {len(batch)} repos in this batch. Total relevant repos so far: {len(repos)}")
 
         if "next" in response.links:
