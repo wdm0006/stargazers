@@ -159,6 +159,30 @@ def test_fetch_user_metadata(httpx_mock):
     assert metadata[0]["starred_at"] == "2023-01-01T00:00:00Z"
 
 
+def test_fetch_user_repos_matches_owner_case_insensitively(httpx_mock):
+    httpx_mock.add_response(
+        url="https://api.github.com/users/WDM0006/repos?type=owner&sort=full_name&per_page=100&page=1",
+        json=[
+            {"full_name": "wdm0006/first", "owner": {"login": "wdm0006"}},
+            {"full_name": "wdm0006/second", "owner": {"login": "wdm0006"}},
+        ],
+    )
+
+    assert fetch_user_repos("WDM0006") == ["wdm0006/first", "wdm0006/second"]
+
+
+def test_fetch_user_repos_excludes_different_owner(httpx_mock):
+    httpx_mock.add_response(
+        url="https://api.github.com/users/WDM0006/repos?type=owner&sort=full_name&per_page=100&page=1",
+        json=[
+            {"full_name": "wdm0006/owned", "owner": {"login": "wdm0006"}},
+            {"full_name": "someone-else/not-owned", "owner": {"login": "someone-else"}},
+        ],
+    )
+
+    assert fetch_user_repos("WDM0006") == ["wdm0006/owned"]
+
+
 def test_fetch_forkers(httpx_mock_non_strict_assertion):
     httpx_mock = httpx_mock_non_strict_assertion  # Use the yielded mock
     repo = "test_owner/test_repo"
