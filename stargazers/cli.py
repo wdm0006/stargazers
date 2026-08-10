@@ -1157,6 +1157,8 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
     repo_clones = []
     all_referrers = {}  # referrer -> {count, uniques}
     skipped = 0
+    clones_unavailable = []
+    referrers_unavailable = []
 
     for repo_name in track(repos_to_process, description=f"Fetching traffic for {username}'s repos"):
         views = fetch_traffic_views(repo_name)
@@ -1165,7 +1167,11 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
             continue
 
         clones = fetch_traffic_clones(repo_name)
+        if clones is None:
+            clones_unavailable.append(repo_name)
         referrers = fetch_traffic_referrers(repo_name)
+        if referrers is None:
+            referrers_unavailable.append(repo_name)
         time.sleep(0.2)
 
         repo_views.append(
@@ -1209,6 +1215,19 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
     console.print(f"Repos analyzed: {len(repo_views)} (skipped {skipped} due to access or missing repositories)")
     console.print(f"\n[bold]Total Views:[/bold] {total_views:,} ({total_unique_views:,} unique)")
     console.print(f"[bold]Total Clones:[/bold] {total_clones:,} ({total_unique_clones:,} unique)")
+
+    if clones_unavailable:
+        console.log(
+            "[bold red]WARNING: clone data was unavailable for "
+            f"{len(clones_unavailable)} repo(s) ({', '.join(clones_unavailable)}) — "
+            "clone totals UNDERCOUNT. Re-run to get complete data.[/]"
+        )
+    if referrers_unavailable:
+        console.log(
+            "[bold red]WARNING: referrer data was unavailable for "
+            f"{len(referrers_unavailable)} repo(s) ({', '.join(referrers_unavailable)}) — "
+            "referrer totals UNDERCOUNT. Re-run to get complete data.[/]"
+        )
 
     # Top repos by views
     top_n = min(10, len(views_df))

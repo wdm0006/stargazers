@@ -2223,3 +2223,120 @@ def test_traffic_command_skips_missing_repo(runner, httpx_mock_non_strict_assert
     ]
     assert any("Repository not found:" in m and "testuser/missing" in m for m in capturing.messages)
     assert any("Repos analyzed: 1 (skipped 1 due to access or missing repositories)" in m for m in capturing.messages)
+
+
+def test_traffic_command_warns_when_clones_unavailable(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    """Views succeed but clones fail: the row keeps the 0 fill, and an undercount warning names the repo."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    mock_user_repos_api(
+        httpx_mock,
+        username,
+        [
+            {"full_name": "testuser/repo1", "owner": {"login": username}},
+            {"full_name": "testuser/repo2", "owner": {"login": username}},
+        ],
+    )
+
+    # repo1 is fully readable.
+    mock_traffic_views_api(httpx_mock, "testuser/repo1", {"count": 50, "uniques": 25, "views": []})
+    mock_traffic_clones_api(httpx_mock, "testuser/repo1", {"count": 10, "uniques": 5, "clones": []})
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo1", [])
+
+    # repo2's views succeed, so it is analyzed rather than skipped, but its clones call fails.
+    mock_traffic_views_api(httpx_mock, "testuser/repo2", {"count": 40, "uniques": 20, "views": []})
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/testuser/repo2/traffic/clones",
+        method="GET",
+        status_code=403,
+        json={"message": "Forbidden"},
+    )
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo2", [])
+
+    result = runner.invoke(cli, ["traffic", username], catch_exceptions=False)
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+
+    assert any(
+        "WARNING: clone data was unavailable for 1 repo(s) (testuser/repo2) — "
+        "clone totals UNDERCOUNT. Re-run to get complete data." in message
+        for message in capturing.messages
+    )
+    # Only the clones fetch failed, so the referrer warning must stay silent.
+    assert not any("referrer data was unavailable" in message for message in capturing.messages)
+
+    # The skipped count keeps its existing meaning: repo2 was analyzed, not skipped.
+    assert any("Repos analyzed: 2 (skipped 0 due to access or missing repositories)" in m for m in capturing.messages)
+
+    # CSV schema and the 0 fill are deliberately unchanged.
+    data = read_csv_output(tmp_path / f"{username}_traffic.csv")
+    assert data == [
+        {"repo": "testuser/repo1", "views": "50", "unique_views": "25", "clones": "10", "unique_clones": "5"},
+        {"repo": "testuser/repo2", "views": "40", "unique_views": "20", "clones": "0", "unique_clones": "0"},
+    ]
+
+
+def test_traffic_command_warns_when_referrers_unavailable(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    """A failed referrers fetch is named in its own undercount warning."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    mock_user_repos_api(httpx_mock, username, [{"full_name": "testuser/repo1", "owner": {"login": username}}])
+    mock_traffic_views_api(httpx_mock, "testuser/repo1", {"count": 50, "uniques": 25, "views": []})
+    mock_traffic_clones_api(httpx_mock, "testuser/repo1", {"count": 10, "uniques": 5, "clones": []})
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/testuser/repo1/traffic/popular/referrers",
+        method="GET",
+        status_code=403,
+        json={"message": "Forbidden"},
+    )
+
+    result = runner.invoke(cli, ["traffic", username], catch_exceptions=False)
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+
+    assert any(
+        "WARNING: referrer data was unavailable for 1 repo(s) (testuser/repo1) — "
+        "referrer totals UNDERCOUNT. Re-run to get complete data." in message
+        for message in capturing.messages
+    )
+    assert not any("clone data was unavailable" in message for message in capturing.messages)
+
+
+def test_traffic_command_no_warning_when_all_fetches_succeed(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    """A fully successful run prints neither undercount warning, including when referrers are legitimately empty."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+
+    mock_user_repos_api(
+        httpx_mock,
+        username,
+        [
+            {"full_name": "testuser/repo1", "owner": {"login": username}},
+            {"full_name": "testuser/repo2", "owner": {"login": username}},
+        ],
+    )
+    mock_traffic_views_api(httpx_mock, "testuser/repo1", {"count": 50, "uniques": 25, "views": []})
+    mock_traffic_clones_api(httpx_mock, "testuser/repo1", {"count": 10, "uniques": 5, "clones": []})
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo1", [{"referrer": "github.com", "count": 5, "uniques": 3}])
+    mock_traffic_views_api(httpx_mock, "testuser/repo2", {"count": 40, "uniques": 20, "views": []})
+    # A repo with zero clones and no referrers at all is genuine data, not a failure.
+    mock_traffic_clones_api(httpx_mock, "testuser/repo2", {"count": 0, "uniques": 0, "clones": []})
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo2", [])
+
+    result = runner.invoke(cli, ["traffic", username], catch_exceptions=False)
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+
+    assert not any("UNDERCOUNT" in message for message in capturing.messages)
