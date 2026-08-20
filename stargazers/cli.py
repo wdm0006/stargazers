@@ -462,6 +462,72 @@ def fetch_releases(repo: str, *, skip_missing: bool = False) -> tuple[list, bool
     return release_details, True
 
 
+def fetch_commits(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]:
+    """Fetch and flatten a repository's commits without per-commit requests."""
+    console.log(f"[bold blue]Fetching commits for:[/] {repo}")
+    url = f"{GITHUB_API}/repos/{repo}/commits"
+    params = {"per_page": 100, "page": 1}
+    commit_details = []
+    rate_limit_retries = 0
+
+    while True:
+        console.log(f"Requesting: {url} with params {params}")
+        try:
+            response = httpx.get(url, headers={**HEADERS, **DEFAULT_HEADERS}, params=params)
+        except httpx.RequestError as e:
+            console.log(
+                f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                f"(network error during pagination: {e})[/]"
+            )
+            return commit_details, False
+
+        if skip_missing and response.status_code == 404:
+            console.log(f"[yellow]Repository {repo} not found, skipping commit data.[/]")
+            return commit_details, False
+
+        error_action = _handle_api_error(response, f"fetching commits for repo {repo}")
+        if error_action == "retry":
+            rate_limit_retries += 1
+            if rate_limit_retries > MAX_RATE_LIMIT_RETRIES:
+                console.log(
+                    f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                    f"(still rate limited after {MAX_RATE_LIMIT_RETRIES} retries)[/]"
+                )
+                return commit_details, False
+            continue
+        rate_limit_retries = 0
+
+        batch = response.json()
+        console.log(f"Fetched {len(batch)} commits in this batch.")
+        if not batch:
+            break
+
+        for item in batch:
+            commit = item.get("commit") or {}
+            author = commit.get("author") or {}
+            committer = commit.get("committer") or {}
+            commit_details.append(
+                {
+                    "sha": item.get("sha"),
+                    "author_login": (item.get("author") or {}).get("login"),
+                    "author_name": author.get("name"),
+                    "authored_at": author.get("date"),
+                    "committed_at": committer.get("date"),
+                    "message": commit.get("message"),
+                    "is_merge": len(item.get("parents") or []) > 1,
+                }
+            )
+
+        if "next" in response.links:
+            params["page"] += 1
+        else:
+            break
+        time.sleep(0.2)
+
+    console.log(f"Total commits fetched for {repo}: {len(commit_details)}")
+    return commit_details, True
+
+
 def fetch_traffic_views(repo: str) -> dict | None:
     """Fetches traffic view data for a repository (last 14 days). Requires push access."""
     url = f"{GITHUB_API}/repos/{repo}/traffic/views"
@@ -951,6 +1017,55 @@ def releases_command(ctx, repositories: tuple[str]):
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
     summarize_and_save(all_items, base_output_name, "releases", timestamp_key=None)
     _summarize_release_cadence(all_items)
+
+
+def _summarize_commit_cadence(items: list) -> None:
+    """Print commit totals, daily cadence, active dates, and leading authors."""
+    merge_count = sum(item["is_merge"] for item in items)
+    console.print("\nCommit Summary:")
+    console.print(f"Total commits: {len(items)}")
+    console.print(f"Merge commits: {merge_count}")
+    console.print(f"Non-merge commits: {len(items) - merge_count}")
+
+    authored_dates = [item["authored_at"][:10] for item in items if item["authored_at"]]
+    if authored_dates:
+        console.print(f"Active date range: {min(authored_dates)} to {max(authored_dates)}")
+        daily_counts = Counter(authored_dates)
+        console.print(f"Median commits per active day: {float(pd.Series(list(daily_counts.values())).median())}")
+
+    author_counts = Counter(item["author_name"] or item["author_login"] for item in items)
+    author_counts.pop(None, None)
+    if author_counts:
+        console.print("\nTop Authors:")
+        for author, count in author_counts.most_common(10):
+            console.print(f"{author}: {count} commits")
+
+
+@cli.command("commits")
+@click.argument("repositories", nargs=-1, required=True)
+@click.pass_context
+def commits_command(ctx, repositories: tuple[str]):
+    """Fetches and analyzes COMMIT cadence and authors for one or more repositories."""
+    console.log(f"Command: 'commits', Args: {repositories}")
+    all_items = []
+    for repo_full_name in repositories:
+        if "/" not in repo_full_name:
+            console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
+            continue
+
+        commit_events, _complete = fetch_commits(repo_full_name)
+        for item in commit_events:
+            item["repo"] = repo_full_name
+        all_items.extend(commit_events)
+
+    if not all_items:
+        console.log("[yellow]No commits found for any repository.[/]")
+        return
+
+    all_items.sort(key=lambda item: item["authored_at"] or "", reverse=True)
+    base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
+    summarize_and_save(all_items, base_output_name, "commits", timestamp_key=None)
+    _summarize_commit_cadence(all_items)
 
 
 @cli.command("account-trend")
