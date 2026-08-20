@@ -17,6 +17,7 @@ from pytest_httpx import HTTPXMock  # Import HTTPXMock for type hinting
 from stargazers.cli import (
     MAX_RATE_LIMIT_RETRIES,
     cli,
+    fetch_commits,
     fetch_contributors,
     fetch_forkers,
     fetch_issues,
@@ -1814,6 +1815,209 @@ def test_cli_help_lists_releases_command(runner):
 
     assert result.exit_code == 0
     assert "releases" in result.output
+
+
+COMMITS_BASE_PARAMS = f"per_page={PER_PAGE}"
+
+
+def _commit_payload(sha, *, name, authored_at, login="alice", parents=1, committed_at=None, message=None):
+    return {
+        "sha": sha,
+        "author": {"login": login} if login else None,
+        "commit": {
+            "author": {"name": name, "date": authored_at},
+            "committer": {"name": "Committer", "date": committed_at or authored_at},
+            "message": message or f"Commit {sha}",
+        },
+        "parents": [{"sha": f"parent-{index}"} for index in range(parents)],
+    }
+
+
+def test_fetch_commits_flattens_linked_unlinked_and_merge_authors(httpx_mock_non_strict_assertion):
+    repo = "owner/repo"
+    httpx_mock_non_strict_assertion.add_response(
+        url=f"{BASE_API_URL}/repos/{repo}/commits?{COMMITS_BASE_PARAMS}&page=1",
+        method="GET",
+        json=[
+            _commit_payload("linked", name="Alice A", authored_at="2024-02-03T04:05:06Z"),
+            _commit_payload("unlinked", name="Git Author", authored_at="2024-02-02T03:04:05Z", login=None),
+            _commit_payload("merge", name="Merger", authored_at="2024-02-01T02:03:04Z", parents=2),
+        ],
+    )
+
+    items, complete = fetch_commits(repo)
+
+    assert complete is True
+    assert items == [
+        {
+            "sha": "linked",
+            "author_login": "alice",
+            "author_name": "Alice A",
+            "authored_at": "2024-02-03T04:05:06Z",
+            "committed_at": "2024-02-03T04:05:06Z",
+            "message": "Commit linked",
+            "is_merge": False,
+        },
+        {
+            "sha": "unlinked",
+            "author_login": None,
+            "author_name": "Git Author",
+            "authored_at": "2024-02-02T03:04:05Z",
+            "committed_at": "2024-02-02T03:04:05Z",
+            "message": "Commit unlinked",
+            "is_merge": False,
+        },
+        {
+            "sha": "merge",
+            "author_login": "alice",
+            "author_name": "Merger",
+            "authored_at": "2024-02-01T02:03:04Z",
+            "committed_at": "2024-02-01T02:03:04Z",
+            "message": "Commit merge",
+            "is_merge": True,
+        },
+    ]
+    assert [request.url.path for request in httpx_mock_non_strict_assertion.get_requests()] == [
+        "/repos/owner/repo/commits"
+    ]
+
+
+def test_fetch_commits_page_two_network_failure_returns_partial_data(
+    httpx_mock_non_strict_assertion, monkeypatch, no_sleep
+):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    repo = "owner/repo"
+    base_url = f"{BASE_API_URL}/repos/{repo}/commits"
+    httpx_mock_non_strict_assertion.add_response(
+        url=f"{base_url}?{COMMITS_BASE_PARAMS}&page=1",
+        method="GET",
+        json=[_commit_payload("one", name="One", authored_at="2024-01-01T00:00:00Z")],
+        headers={"Link": f'<{base_url}?{COMMITS_BASE_PARAMS}&page=2>; rel="next"'},
+    )
+    httpx_mock_non_strict_assertion.add_exception(
+        httpx.ReadError("connection lost"), url=f"{base_url}?{COMMITS_BASE_PARAMS}&page=2"
+    )
+
+    items, complete = fetch_commits(repo)
+
+    assert complete is False
+    assert [(item["sha"], item["author_name"]) for item in items] == [("one", "One")]
+    assert any(f"WARNING: incomplete data for {repo}" in message for message in capturing.messages)
+
+
+def test_fetch_commits_paginates_with_exact_values(httpx_mock_non_strict_assertion, no_sleep):
+    repo = "owner/repo"
+    base_url = f"{BASE_API_URL}/repos/{repo}/commits"
+    httpx_mock_non_strict_assertion.add_response(
+        url=f"{base_url}?{COMMITS_BASE_PARAMS}&page=1",
+        method="GET",
+        json=[_commit_payload("new", name="New Author", authored_at="2024-02-02T00:00:00Z")],
+        headers={"Link": f'<{base_url}?{COMMITS_BASE_PARAMS}&page=2>; rel="next"'},
+    )
+    httpx_mock_non_strict_assertion.add_response(
+        url=f"{base_url}?{COMMITS_BASE_PARAMS}&page=2",
+        method="GET",
+        json=[
+            _commit_payload(
+                "old",
+                name="Old Author",
+                authored_at="2024-02-01T00:00:00Z",
+                committed_at="2024-02-01T01:00:00Z",
+                login=None,
+                parents=2,
+                message="Merge old work",
+            )
+        ],
+    )
+
+    items, complete = fetch_commits(repo)
+
+    assert complete is True
+    assert [(item["sha"], item["author_name"], item["author_login"], item["is_merge"]) for item in items] == [
+        ("new", "New Author", "alice", False),
+        ("old", "Old Author", None, True),
+    ]
+    assert items[1]["committed_at"] == "2024-02-01T01:00:00Z"
+    assert items[1]["message"] == "Merge old work"
+
+
+def test_fetch_commits_rate_limit_is_bounded(httpx_mock_non_strict_assertion, monkeypatch, no_sleep):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    repo = "owner/repo"
+    url = f"{BASE_API_URL}/repos/{repo}/commits?{COMMITS_BASE_PARAMS}&page=1"
+    httpx_mock_non_strict_assertion.add_response(
+        url=url, method="GET", status_code=403, text="API rate limit exceeded", is_reusable=True
+    )
+
+    items, complete = fetch_commits(repo)
+
+    assert items == []
+    assert complete is False
+    assert len(httpx_mock_non_strict_assertion.get_requests()) == MAX_RATE_LIMIT_RETRIES + 1
+    assert any(f"WARNING: incomplete data for {repo}" in message for message in capturing.messages)
+
+
+def test_commits_command_multi_repo_csv_order_and_summary(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.chdir(tmp_path)
+    fixtures = {
+        "owner/one": [
+            _commit_payload("a3", name="Alice", authored_at="2024-01-03T12:00:00Z", parents=2),
+            _commit_payload("a1", name="Alice", authored_at="2024-01-01T12:00:00Z"),
+        ],
+        "owner/two": [
+            _commit_payload("b3", name="Bob", authored_at="2024-01-03T18:00:00Z", login=None),
+            _commit_payload("b2", name="Bob", authored_at="2024-01-02T12:00:00Z", login=None),
+            _commit_payload("b1", name="Alice", authored_at="2024-01-01T18:00:00Z"),
+        ],
+    }
+    for repo, payload in fixtures.items():
+        httpx_mock_non_strict_assertion.add_response(
+            url=f"{BASE_API_URL}/repos/{repo}/commits?{COMMITS_BASE_PARAMS}&page=1", method="GET", json=payload
+        )
+
+    result = runner.invoke(cli, ["commits", "owner/one", "owner/two"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    with open(tmp_path / "all_repos_commits.csv", encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        assert reader.fieldnames == [
+            "sha",
+            "author_login",
+            "author_name",
+            "authored_at",
+            "committed_at",
+            "message",
+            "is_merge",
+            "repo",
+        ]
+        rows = list(reader)
+    assert [(row["sha"], row["repo"], row["author_login"]) for row in rows] == [
+        ("b3", "owner/two", ""),
+        ("a3", "owner/one", "alice"),
+        ("b2", "owner/two", ""),
+        ("b1", "owner/two", "alice"),
+        ("a1", "owner/one", "alice"),
+    ]
+    assert "Total commits: 5" in capturing.messages
+    assert "Merge commits: 1" in capturing.messages
+    assert "Non-merge commits: 4" in capturing.messages
+    assert "Active date range: 2024-01-01 to 2024-01-03" in capturing.messages
+    assert "Median commits per active day: 2.0" in capturing.messages
+    assert "Alice: 3 commits" in capturing.messages
+    assert "Bob: 2 commits" in capturing.messages
+
+
+def test_cli_help_lists_commits_command(runner):
+    result = runner.invoke(cli, ["--help"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert "commits" in result.output
 
 
 @patch("stargazers.cli.plt")

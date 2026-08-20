@@ -48,6 +48,7 @@ After installation, you can run the CLI from anywhere in your shell using the `s
 *   `contributors`: Fetches and analyzes contributors and commit counts for one or more repositories.
 *   `issues`: Fetches and analyzes issue and pull-request engagement for one or more repositories.
 *   `releases`: Fetches release cadence and per-release asset download counts for one or more repositories.
+*   `commits`: Fetches commit cadence, merge counts, and author activity for one or more repositories.
 *   `account-trend`: Analyzes star trends over time for all of a user's owned repositories.
 
 ### Analyzing Repository Stargazers
@@ -121,6 +122,17 @@ Example:
 stargazers releases wdm0006/pygeohash wdm0006/elote
 ```
 
+### Analyzing Commit Cadence and Authors
+
+```sh
+stargazers commits <owner/repo> [<owner/repo> ...]
+```
+
+Each row contains `sha`, `author_login`, `author_name`, `authored_at`, `committed_at`, `message`,
+`is_merge`, and `repo`, sorted newest first by author date. Git-only authors remain in the CSV with
+a blank login. The summary reports merge and non-merge totals, the active date range, median commits
+per active day, and top authors. The command uses only the paginated commits list endpoint.
+
 ### Analyzing User Account Star Trends
 
 To analyze the overall star trend for a user's account, optionally including other specific repositories, excluding some, and displaying a terminal chart:
@@ -149,6 +161,8 @@ stargazers account-trend wdm0006 --include-repo scikit-learn-contrib/category_en
 - For the `issues` subcommand with multiple repos: `all_repos_issues.csv`.
 - For the `releases` subcommand with a single repo: `<owner>_<repo>_releases.csv`.
 - For the `releases` subcommand with multiple repos: `all_repos_releases.csv`.
+- For the `commits` subcommand with a single repo: `<owner>_<repo>_commits.csv`.
+- For the `commits` subcommand with multiple repos: `all_repos_commits.csv`.
 - For the `account-trend` subcommand: `<username>_account_stars_by_day.csv`.
   This file will contain columns: `star_date`, `new_stars_on_day`, `cumulative_stars_up_to_day`.
 
