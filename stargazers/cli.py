@@ -87,8 +87,12 @@ def _handle_api_error(response: httpx.Response, context_message: str):
     return None
 
 
-def fetch_user_repos(username: str) -> list[str]:
-    """Fetches all repositories for a given user where they are the owner."""
+def _fetch_user_repo_records(username: str) -> list[dict]:
+    """Paginate the owned-repositories endpoint and return the raw payload records.
+
+    The list response already carries a complete per-repository snapshot, so callers that
+    want more than ``full_name`` reuse these records rather than making follow-up calls.
+    """
     console.log(f"[bold blue]Fetching repositories for user:[/] {username}")
     repos = []
     url = f"{GITHUB_API}/users/{username}/repos"
@@ -119,7 +123,7 @@ def fetch_user_repos(username: str) -> list[str]:
         if not batch:
             break
 
-        repos.extend([repo["full_name"] for repo in batch if repo["owner"]["login"].lower() == username.lower()])
+        repos.extend([repo for repo in batch if repo["owner"]["login"].lower() == username.lower()])
         console.log(f"Fetched {len(batch)} repos in this batch. Total relevant repos so far: {len(repos)}")
 
         if "next" in response.links:
@@ -130,6 +134,39 @@ def fetch_user_repos(username: str) -> list[str]:
 
     console.log(f"Total repositories fetched for {username}: {len(repos)}")
     return repos
+
+
+def fetch_user_repos(username: str) -> list[str]:
+    """Fetches all repositories for a given user where they are the owner."""
+    return [repo["full_name"] for repo in _fetch_user_repo_records(username)]
+
+
+def fetch_repo_overview(username: str) -> list[dict]:
+    """Flatten the per-repository snapshot already carried by the owned-repositories list.
+
+    Costs no requests beyond the pages ``fetch_user_repos`` already walks. The payload's
+    watcher count is deliberately not exported: on this list response it is an alias for the
+    star count, not the subscriber count (which appears only on the single-repository endpoint).
+    """
+    return [
+        {
+            "repo": item.get("full_name"),
+            "description": item.get("description"),
+            "language": item.get("language"),
+            "topics": ", ".join(item.get("topics") or []),
+            "license": (item.get("license") or {}).get("spdx_id") or "",
+            "stars": item.get("stargazers_count", 0),
+            "forks": item.get("forks_count", 0),
+            "open_issues": item.get("open_issues_count", 0),
+            "size_kb": item.get("size", 0),
+            "is_fork": item.get("fork", False),
+            "archived": item.get("archived", False),
+            "created_at": item.get("created_at"),
+            "pushed_at": item.get("pushed_at"),
+            "homepage": item.get("homepage"),
+        }
+        for item in _fetch_user_repo_records(username)
+    ]
 
 
 def fetch_stargazers(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]:
@@ -1066,6 +1103,96 @@ def commits_command(ctx, repositories: tuple[str]):
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
     summarize_and_save(all_items, base_output_name, "commits", timestamp_key=None)
     _summarize_commit_cadence(all_items)
+
+
+def _summarize_repo_portfolio(items: list) -> None:
+    """Print portfolio totals, fork/archive counts, leading repositories, and languages."""
+    console.print("\nRepository Overview:")
+    console.print(f"Total repositories: {len(items)}")
+    console.print(f"Forks: {sum(item['is_fork'] for item in items)}")
+    console.print(f"Archived: {sum(item['archived'] for item in items)}")
+    console.print(f"Total stars: {sum(item['stars'] for item in items)}")
+    console.print(f"Total forks: {sum(item['forks'] for item in items)}")
+
+    top_starred = sorted(items, key=lambda item: item["stars"], reverse=True)[:10]
+    if top_starred:
+        console.print("\nTop Repositories by Stars:")
+        for item in top_starred:
+            console.print(f"{item['repo']}: {item['stars']} stars")
+
+    language_counts = Counter(item["language"] for item in items)
+    language_counts.pop(None, None)
+    if language_counts:
+        console.print("\nLanguage Breakdown:")
+        for language, count in language_counts.most_common():
+            console.print(f"{language}: {count} repositories")
+
+
+@cli.command("overview")
+@click.argument("username")
+@click.option(
+    "--exclude-repo",
+    "exclude_repos",
+    multiple=True,
+    help="Repositories to exclude (e.g., owner/repo). Can be used multiple times.",
+)
+@click.option(
+    "--include-repo",
+    "include_repos",
+    multiple=True,
+    help="Additional repositories to include (format: owner/repo). Can be used multiple times.",
+)
+@click.pass_context
+def overview_command(ctx, username: str, exclude_repos: tuple[str], include_repos: tuple[str]):
+    """
+    Builds a portfolio snapshot of the repositories owned by USERNAME.
+
+    The snapshot comes from the same owned-repositories listing account-trend and traffic
+    already fetch, so it costs no extra API calls — and it therefore covers OWNED repositories
+    only. A --include-repo naming a repository the account does not own has no snapshot to
+    report and is skipped with a warning.
+    """
+    console.log(
+        f"Command: 'overview', User: {username}, Include Repos: {include_repos}, Exclude Repos: {exclude_repos}"
+    )
+
+    include_repos = _valid_repo_args(include_repos)
+    exclude_repos = _valid_repo_args(exclude_repos)
+
+    snapshots = fetch_repo_overview(username)
+    owned_repos = {snapshot["repo"] for snapshot in snapshots}
+    console.log(f"Found {len(owned_repos)} repositories owned by {username}.")
+
+    candidate_repos = [snapshot["repo"] for snapshot in snapshots]
+    if include_repos:
+        console.log(f"Additionally including {len(include_repos)} repositories: {include_repos}")
+        candidate_repos.extend(list(include_repos))
+
+    unique_candidate_repos = sorted(set(candidate_repos))
+
+    if exclude_repos:
+        console.log(f"Excluding: {exclude_repos}")
+        repos_to_process = [repo for repo in unique_candidate_repos if repo not in exclude_repos]
+    else:
+        repos_to_process = unique_candidate_repos
+
+    unavailable = [repo for repo in repos_to_process if repo not in owned_repos]
+    if unavailable:
+        console.log(
+            f"[yellow]No snapshot for {len(unavailable)} repository(ies) not owned by {username} "
+            f"({', '.join(unavailable)}) — overview covers owned repositories only.[/]"
+        )
+
+    selected = set(repos_to_process)
+    all_items = [snapshot for snapshot in snapshots if snapshot["repo"] in selected]
+
+    if not all_items:
+        console.log(f"[yellow]No repositories to process for user {username}.[/]")
+        return
+
+    all_items.sort(key=lambda item: item["stars"], reverse=True)
+    summarize_and_save(all_items, username, "repos_overview", timestamp_key=None)
+    _summarize_repo_portfolio(all_items)
 
 
 @cli.command("account-trend")
