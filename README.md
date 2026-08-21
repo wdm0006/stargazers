@@ -49,6 +49,7 @@ After installation, you can run the CLI from anywhere in your shell using the `s
 *   `issues`: Fetches and analyzes issue and pull-request engagement for one or more repositories.
 *   `releases`: Fetches release cadence and per-release asset download counts for one or more repositories.
 *   `commits`: Fetches commit cadence, merge counts, and author activity for one or more repositories.
+*   `overview`: Builds a per-repository portfolio snapshot of an account's owned repositories.
 *   `account-trend`: Analyzes star trends over time for all of a user's owned repositories.
 
 ### Analyzing Repository Stargazers
@@ -133,6 +134,37 @@ Each row contains `sha`, `author_login`, `author_name`, `authored_at`, `committe
 a blank login. The summary reports merge and non-merge totals, the active date range, median commits
 per active day, and top authors. The command uses only the paginated commits list endpoint.
 
+### Building an Account Portfolio Overview
+
+```sh
+stargazers overview <username> [--include-repo <owner/repo>] [--exclude-repo <owner/repo>]
+```
+
+Answers "what does my whole account look like right now" — which repositories have the most stars,
+which are stale, which are archived, and what languages and topics they cover. GitHub's own UI has
+no way to export this.
+
+The snapshot is read straight off the owned-repositories listing that `account-trend` and `traffic`
+already fetch, so it costs **no extra API calls** and needs no per-repository follow-up requests. It
+therefore covers repositories the account **owns**: an `--include-repo` naming a repository owned by
+somebody else has no snapshot to report and is skipped with a warning.
+
+Each row carries `repo`, `description`, `language`, `topics` (comma-separated), `license` (the SPDX
+id, blank when unlicensed), `stars`, `forks`, `open_issues`, `size_kb`, `is_fork`, `archived`,
+`created_at`, `pushed_at`, and `homepage`. Rows are sorted by star count, highest first. The printed
+summary reports the total repositories, how many are forks and how many archived, total stars and
+forks, the ten most-starred repositories, and a language breakdown.
+
+Note that the repository list payload's watcher count is an alias for the star count rather than the
+subscriber count, so it is deliberately not exported — a "watchers" column would silently duplicate
+`stars`.
+
+Example:
+```sh
+stargazers overview wdm0006
+stargazers overview wdm0006 --exclude-repo wdm0006/some-old-repo
+```
+
 ### Analyzing User Account Star Trends
 
 To analyze the overall star trend for a user's account, optionally including other specific repositories, excluding some, and displaying a terminal chart:
@@ -163,6 +195,7 @@ stargazers account-trend wdm0006 --include-repo scikit-learn-contrib/category_en
 - For the `releases` subcommand with multiple repos: `all_repos_releases.csv`.
 - For the `commits` subcommand with a single repo: `<owner>_<repo>_commits.csv`.
 - For the `commits` subcommand with multiple repos: `all_repos_commits.csv`.
+- For the `overview` subcommand: `<username>_repos_overview.csv`.
 - For the `account-trend` subcommand: `<username>_account_stars_by_day.csv`.
   This file will contain columns: `star_date`, `new_stars_on_day`, `cumulative_stars_up_to_day`.
 

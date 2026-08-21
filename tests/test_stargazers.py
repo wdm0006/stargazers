@@ -2544,3 +2544,248 @@ def test_traffic_command_no_warning_when_all_fetches_succeed(
     assert result.exit_code == 0, f"CLI Error: {result.output}"
 
     assert not any("UNDERCOUNT" in message for message in capturing.messages)
+
+
+OVERVIEW_REPOS_BASE_URL = f"{BASE_API_URL}/users/testuser/repos?type=owner&sort=full_name&per_page={PER_PAGE}"
+
+
+def _repo_snapshot(full_name, owner="testuser", **overrides):
+    """Build a repository-list payload item shaped like the live /users/{u}/repos response."""
+    payload = {
+        "full_name": full_name,
+        "owner": {"login": owner},
+        "description": f"about {full_name}",
+        "language": "Python",
+        "topics": ["cli"],
+        "license": {"spdx_id": "MIT"},
+        "stargazers_count": 1,
+        # An alias for the star count on this payload; the CSV must not carry it.
+        "watchers_count": 1,
+        "forks_count": 0,
+        "open_issues_count": 0,
+        "size": 10,
+        "fork": False,
+        "archived": False,
+        "created_at": "2020-01-01T00:00:00Z",
+        "pushed_at": "2024-01-01T00:00:00Z",
+        "homepage": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def mock_user_repos_pages(httpx_mock, username, pages):
+    """Mock the owned-repositories endpoint across several linked pages."""
+    base = f"{BASE_API_URL}/users/{username}/repos?type=owner&sort=full_name&per_page={PER_PAGE}"
+    for index, page in enumerate(pages, start=1):
+        headers = {"Link": f'<{base}&page={index + 1}>; rel="next"'} if index < len(pages) else {}
+        httpx_mock.add_response(url=f"{base}&page={index}", method="GET", json=page, status_code=200, headers=headers)
+
+
+def _overview_fixture_pages():
+    """Two pages whose per-repository numbers all differ, so a wrong aggregation cannot pass."""
+    return [
+        [
+            _repo_snapshot(
+                "testuser/alpha",
+                topics=["cli", "analytics"],
+                stargazers_count=30,
+                watchers_count=30,
+                forks_count=4,
+                open_issues_count=2,
+                size=120,
+                pushed_at="2024-05-01T00:00:00Z",
+                homepage="https://alpha.example",
+            ),
+            _repo_snapshot(
+                "testuser/beta",
+                description=None,
+                topics=[],
+                license=None,
+                stargazers_count=7,
+                watchers_count=7,
+                forks_count=1,
+                size=12,
+                archived=True,
+                created_at="2021-02-03T00:00:00Z",
+                pushed_at="2022-03-04T00:00:00Z",
+            ),
+            _repo_snapshot("otheracct/not-owned", owner="otheracct", stargazers_count=999),
+        ],
+        [
+            _repo_snapshot(
+                "testuser/gamma",
+                language="Rust",
+                topics=["rust"],
+                license={"spdx_id": "Apache-2.0"},
+                stargazers_count=12,
+                watchers_count=12,
+                forks_count=9,
+                open_issues_count=5,
+                size=300,
+                fork=True,
+                archived=True,
+                created_at="2022-06-07T00:00:00Z",
+                pushed_at="2023-08-09T00:00:00Z",
+            ),
+        ],
+    ]
+
+
+def test_overview_command_writes_exact_rows(runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    mock_user_repos_pages(httpx_mock, "testuser", _overview_fixture_pages())
+
+    result = runner.invoke(cli, ["overview", "testuser"], catch_exceptions=False)
+
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+    with open(tmp_path / "testuser_repos_overview.csv", encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        assert reader.fieldnames == [
+            "repo",
+            "description",
+            "language",
+            "topics",
+            "license",
+            "stars",
+            "forks",
+            "open_issues",
+            "size_kb",
+            "is_fork",
+            "archived",
+            "created_at",
+            "pushed_at",
+            "homepage",
+        ]
+        rows = [dict(row) for row in reader]
+
+    assert rows == [
+        {
+            "repo": "testuser/alpha",
+            "description": "about testuser/alpha",
+            "language": "Python",
+            "topics": "cli, analytics",
+            "license": "MIT",
+            "stars": "30",
+            "forks": "4",
+            "open_issues": "2",
+            "size_kb": "120",
+            "is_fork": "False",
+            "archived": "False",
+            "created_at": "2020-01-01T00:00:00Z",
+            "pushed_at": "2024-05-01T00:00:00Z",
+            "homepage": "https://alpha.example",
+        },
+        {
+            "repo": "testuser/gamma",
+            "description": "about testuser/gamma",
+            "language": "Rust",
+            "topics": "rust",
+            "license": "Apache-2.0",
+            "stars": "12",
+            "forks": "9",
+            "open_issues": "5",
+            "size_kb": "300",
+            "is_fork": "True",
+            "archived": "True",
+            "created_at": "2022-06-07T00:00:00Z",
+            "pushed_at": "2023-08-09T00:00:00Z",
+            "homepage": "",
+        },
+        {
+            "repo": "testuser/beta",
+            "description": "",
+            "language": "Python",
+            "topics": "",
+            "license": "",
+            "stars": "7",
+            "forks": "1",
+            "open_issues": "0",
+            "size_kb": "12",
+            "is_fork": "False",
+            "archived": "True",
+            "created_at": "2021-02-03T00:00:00Z",
+            "pushed_at": "2022-03-04T00:00:00Z",
+            "homepage": "",
+        },
+    ]
+
+
+def test_overview_command_makes_no_extra_requests(runner, httpx_mock, tmp_path, monkeypatch):
+    """The snapshot comes off the repository list itself — nothing else may be requested."""
+    monkeypatch.chdir(tmp_path)
+    mock_user_repos_pages(httpx_mock, "testuser", _overview_fixture_pages())
+
+    result = runner.invoke(cli, ["overview", "testuser"], catch_exceptions=False)
+
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+    assert [str(request.url) for request in httpx_mock.get_requests()] == [
+        f"{OVERVIEW_REPOS_BASE_URL}&page=1",
+        f"{OVERVIEW_REPOS_BASE_URL}&page=2",
+    ]
+
+
+def test_overview_command_excludes_other_owners_and_excluded_repos(runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    mock_user_repos_pages(httpx_mock, "testuser", _overview_fixture_pages())
+
+    result = runner.invoke(cli, ["overview", "testuser", "--exclude-repo", "testuser/gamma"], catch_exceptions=False)
+
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+    rows = read_csv_output(tmp_path / "testuser_repos_overview.csv")
+    assert [row["repo"] for row in rows] == ["testuser/alpha", "testuser/beta"]
+
+
+def test_overview_command_warns_for_unowned_include_repo(runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    mock_user_repos_pages(httpx_mock, "testuser", _overview_fixture_pages())
+
+    result = runner.invoke(
+        cli, ["overview", "testuser", "--include-repo", "otheracct/elsewhere"], catch_exceptions=False
+    )
+
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+    assert any(
+        "otheracct/elsewhere" in message and "owned repositories only" in message for message in capturing.messages
+    )
+    rows = read_csv_output(tmp_path / "testuser_repos_overview.csv")
+    assert [row["repo"] for row in rows] == ["testuser/alpha", "testuser/gamma", "testuser/beta"]
+
+
+def test_overview_command_summary(runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    mock_user_repos_pages(httpx_mock, "testuser", _overview_fixture_pages())
+
+    result = runner.invoke(cli, ["overview", "testuser"], catch_exceptions=False)
+
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+    assert "Total repositories: 3" in capturing.messages
+    assert "Forks: 1" in capturing.messages
+    assert "Archived: 2" in capturing.messages
+    assert "Total stars: 49" in capturing.messages
+    assert "Total forks: 14" in capturing.messages
+    assert "testuser/alpha: 30 stars" in capturing.messages
+    assert "testuser/gamma: 12 stars" in capturing.messages
+    assert "testuser/beta: 7 stars" in capturing.messages
+    assert "Python: 2 repositories" in capturing.messages
+    assert "Rust: 1 repositories" in capturing.messages
+
+
+def test_cli_help_lists_overview_command(runner):
+    result = runner.invoke(cli, ["--help"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert "overview" in result.output
+
+
+def test_overview_help_documents_options(runner):
+    result = runner.invoke(cli, ["overview", "--help"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert "USERNAME" in result.output
+    assert "--include-repo" in result.output
+    assert "--exclude-repo" in result.output
