@@ -818,6 +818,15 @@ def plot_account_trend(df: pd.DataFrame, title: str) -> None:
     console.print()  # Add a newline after the plot for better separation
 
 
+def _warn_incomplete(repos: list[str], noun: str) -> None:
+    """Warn that a saved dataset is missing records from the named repositories."""
+    if repos:
+        console.log(
+            f"[bold red]WARNING: {noun} data is incomplete for {len(repos)} repo(s) "
+            f"({', '.join(repos)}) — the saved file UNDERCOUNTS. Re-run to get complete data.[/]"
+        )
+
+
 @click.group()
 @click.version_option(package_name="stargazers")  # Assumes 'name' in pyproject.toml is 'stargazers'
 def cli():
@@ -837,14 +846,17 @@ def stargazers_repos_command(ctx, repositories: tuple[str]):
     """Fetches and analyzes STARGÀZERS for one or more repositories."""
     console.log(f"Command: 'repos', Args: {repositories}")
     all_metadata = []
+    incomplete_repos = []
     for repo_full_name in repositories:
         if "/" not in repo_full_name:
             console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
             continue
 
-        stargazer_events, _complete = fetch_stargazers(
+        stargazer_events, complete = fetch_stargazers(
             repo_full_name
         )  # List of {'login': ..., 'starred_at': ..., 'user_details': ...}
+        if not complete:
+            incomplete_repos.append(repo_full_name)
 
         # Add repo_full_name to each stargazer event before fetching metadata
         for sg_event in stargazer_events:
@@ -863,6 +875,7 @@ def stargazers_repos_command(ctx, repositories: tuple[str]):
         base_output_name = "all_repos"  # For multiple repos or if a single one was invalid
 
     summarize_and_save(all_metadata, base_output_name, "stargazers", timestamp_key="starred_at")
+    _warn_incomplete(incomplete_repos, "stargazer")
 
 
 @cli.command("forkers")
@@ -872,13 +885,16 @@ def forkers_command(ctx, repositories: tuple[str]):
     """Fetches and analyzes FORKERS for one or more repositories."""
     console.log(f"Command: 'forkers', Args: {repositories}")
     all_metadata = []
+    incomplete_repos = []
     for repo_full_name in repositories:
         if "/" not in repo_full_name:
             console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
             continue
 
         # List of {'login': ..., 'forked_at': ..., 'user_details': ...}
-        forker_events, _complete = fetch_forkers(repo_full_name)
+        forker_events, complete = fetch_forkers(repo_full_name)
+        if not complete:
+            incomplete_repos.append(repo_full_name)
 
         for fk_event in forker_events:
             fk_event["repo"] = repo_full_name
@@ -896,6 +912,7 @@ def forkers_command(ctx, repositories: tuple[str]):
         base_output_name = "all_repos"
 
     summarize_and_save(all_metadata, base_output_name, "forkers", timestamp_key="forked_at")
+    _warn_incomplete(incomplete_repos, "forker")
 
 
 @cli.command("contributors")
@@ -905,12 +922,15 @@ def contributors_command(ctx, repositories: tuple[str]):
     """Fetches and analyzes CONTRIBUTORS for one or more repositories."""
     console.log(f"Command: 'contributors', Args: {repositories}")
     all_metadata = []
+    incomplete_repos = []
     for repo_full_name in repositories:
         if "/" not in repo_full_name:
             console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
             continue
 
-        contributor_events, _complete = fetch_contributors(repo_full_name)
+        contributor_events, complete = fetch_contributors(repo_full_name)
+        if not complete:
+            incomplete_repos.append(repo_full_name)
         for contributor_event in contributor_events:
             contributor_event["repo"] = repo_full_name
 
@@ -923,6 +943,7 @@ def contributors_command(ctx, repositories: tuple[str]):
     all_metadata.sort(key=lambda contributor: contributor["contributions"], reverse=True)
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
     summarize_and_save(all_metadata, base_output_name, "contributors", timestamp_key=None)
+    _warn_incomplete(incomplete_repos, "contributor")
 
     console.print("\nContributor Summary:")
     console.print(f"Total contributors: {len(all_metadata)}")
@@ -967,12 +988,15 @@ def issues_command(ctx, repositories: tuple[str]):
     """Fetches and analyzes ISSUE and PULL REQUEST engagement for one or more repositories."""
     console.log(f"Command: 'issues', Args: {repositories}")
     all_items = []
+    incomplete_repos = []
     for repo_full_name in repositories:
         if "/" not in repo_full_name:
             console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
             continue
 
-        issue_events, _complete = fetch_issues(repo_full_name)
+        issue_events, complete = fetch_issues(repo_full_name)
+        if not complete:
+            incomplete_repos.append(repo_full_name)
         for item in issue_events:
             item["days_to_close"] = _days_between(item["created_at"], item["closed_at"])
             item["repo"] = repo_full_name
@@ -987,6 +1011,7 @@ def issues_command(ctx, repositories: tuple[str]):
     all_items.sort(key=lambda item: item["created_at"] or "", reverse=True)
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
     summarize_and_save(all_items, base_output_name, "issues", timestamp_key=None)
+    _warn_incomplete(incomplete_repos, "issue and pull request")
     _summarize_issue_engagement(all_items)
 
 
@@ -1032,12 +1057,15 @@ def releases_command(ctx, repositories: tuple[str]):
     """Fetches and analyzes RELEASE cadence and asset downloads for one or more repositories."""
     console.log(f"Command: 'releases', Args: {repositories}")
     all_items = []
+    incomplete_repos = []
     for repo_full_name in repositories:
         if "/" not in repo_full_name:
             console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
             continue
 
-        release_events, _complete = fetch_releases(repo_full_name)
+        release_events, complete = fetch_releases(repo_full_name)
+        if not complete:
+            incomplete_repos.append(repo_full_name)
         # Per repository, before these events join the shared list.
         _apply_days_since_previous(release_events)
         for item in release_events:
@@ -1053,6 +1081,7 @@ def releases_command(ctx, repositories: tuple[str]):
     all_items.sort(key=lambda item: item["published_at"] or "", reverse=True)
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
     summarize_and_save(all_items, base_output_name, "releases", timestamp_key=None)
+    _warn_incomplete(incomplete_repos, "release")
     _summarize_release_cadence(all_items)
 
 
@@ -1085,12 +1114,15 @@ def commits_command(ctx, repositories: tuple[str]):
     """Fetches and analyzes COMMIT cadence and authors for one or more repositories."""
     console.log(f"Command: 'commits', Args: {repositories}")
     all_items = []
+    incomplete_repos = []
     for repo_full_name in repositories:
         if "/" not in repo_full_name:
             console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
             continue
 
-        commit_events, _complete = fetch_commits(repo_full_name)
+        commit_events, complete = fetch_commits(repo_full_name)
+        if not complete:
+            incomplete_repos.append(repo_full_name)
         for item in commit_events:
             item["repo"] = repo_full_name
         all_items.extend(commit_events)
@@ -1102,6 +1134,7 @@ def commits_command(ctx, repositories: tuple[str]):
     all_items.sort(key=lambda item: item["authored_at"] or "", reverse=True)
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
     summarize_and_save(all_items, base_output_name, "commits", timestamp_key=None)
+    _warn_incomplete(incomplete_repos, "commit")
     _summarize_commit_cadence(all_items)
 
 
