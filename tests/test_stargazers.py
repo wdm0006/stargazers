@@ -2020,6 +2020,143 @@ def test_cli_help_lists_commits_command(runner):
     assert "commits" in result.output
 
 
+PARTIAL_COMMAND_CASES = [
+    (
+        "repos",
+        "stargazers",
+        [{"user": {"login": "partial-user"}, "starred_at": "2024-01-01T00:00:00Z"}],
+    ),
+    (
+        "forkers",
+        "forks",
+        [{"owner": {"login": "partial-user"}, "created_at": "2024-01-01T00:00:00Z"}],
+    ),
+    ("contributors", "contributors", [{"login": "partial-user", "contributions": 3}]),
+    (
+        "issues",
+        "issues",
+        [
+            {
+                "number": 1,
+                "title": "Partial issue",
+                "user": {"login": "partial-user"},
+                "state": "open",
+                "labels": [],
+                "comments": 0,
+                "created_at": "2024-01-01T00:00:00Z",
+                "closed_at": None,
+            }
+        ],
+    ),
+    (
+        "releases",
+        "releases",
+        [
+            {
+                "tag_name": "v1.0.0",
+                "name": "First",
+                "author": {"login": "partial-user"},
+                "draft": False,
+                "prerelease": False,
+                "created_at": "2024-01-01T00:00:00Z",
+                "published_at": "2024-01-01T00:00:00Z",
+                "assets": [],
+            }
+        ],
+    ),
+    (
+        "commits",
+        "commits",
+        [
+            {
+                "sha": "abc123",
+                "author": {"login": "partial-user"},
+                "commit": {
+                    "author": {"name": "Partial User", "date": "2024-01-01T00:00:00Z"},
+                    "committer": {"date": "2024-01-01T00:00:00Z"},
+                    "message": "First commit",
+                },
+                "parents": [],
+            }
+        ],
+    ),
+]
+
+
+def _mock_command_page(httpx_mock, repo, endpoint, payload, *, incomplete):
+    query = "state=all&per_page=100&page=1" if endpoint == "issues" else "per_page=100&page=1"
+    next_query = "state=all&per_page=100&page=2" if endpoint == "issues" else "per_page=100&page=2"
+    base_url = f"{BASE_API_URL}/repos/{repo}/{endpoint}"
+    headers = {"Link": f'<{base_url}?{next_query}>; rel="next"'} if incomplete else {}
+    httpx_mock.add_response(url=f"{base_url}?{query}", json=payload, headers=headers)
+    if incomplete:
+        httpx_mock.add_exception(httpx.ConnectError("connection dropped"), url=f"{base_url}?{next_query}")
+
+    if endpoint in {"stargazers", "forks", "contributors"}:
+        httpx_mock.add_response(url=f"{BASE_API_URL}/users/partial-user", json=GOOD_USER_PROFILE)
+
+
+@pytest.mark.parametrize(("command", "endpoint", "payload"), PARTIAL_COMMAND_CASES)
+def test_repository_command_saves_partial_rows_then_warns(
+    command, endpoint, payload, runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    httpx_mock = httpx_mock_non_strict_assertion
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    repo = "testowner/partial"
+    _mock_command_page(httpx_mock, repo, endpoint, payload, incomplete=True)
+
+    result = runner.invoke(cli, [command, repo], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    output_file = tmp_path / f"testowner_partial_{command if command != 'repos' else 'stargazers'}.csv"
+    assert output_file.exists()
+    assert len(read_csv_output(output_file)) == 1
+    saved_index = next(i for i, message in enumerate(capturing.messages) if "Saved 1 items" in message)
+    warning_index = next(i for i, message in enumerate(capturing.messages) if "the saved file UNDERCOUNTS" in message)
+    assert warning_index > saved_index
+    assert repo in capturing.messages[warning_index]
+
+
+@pytest.mark.parametrize(("command", "endpoint", "payload"), PARTIAL_COMMAND_CASES)
+def test_repository_command_does_not_warn_for_complete_fetch(
+    command, endpoint, payload, runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    httpx_mock = httpx_mock_non_strict_assertion
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    repo = "testowner/complete"
+    _mock_command_page(httpx_mock, repo, endpoint, payload, incomplete=False)
+
+    result = runner.invoke(cli, [command, repo], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert not any("the saved file UNDERCOUNTS" in message for message in capturing.messages)
+
+
+def test_repository_command_warning_names_only_incomplete_repo(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    httpx_mock = httpx_mock_non_strict_assertion
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    payload = [{"login": "partial-user", "contributions": 3}]
+    _mock_command_page(httpx_mock, "testowner/complete", "contributors", payload, incomplete=False)
+    _mock_command_page(httpx_mock, "testowner/partial", "contributors", payload, incomplete=True)
+
+    result = runner.invoke(cli, ["contributors", "testowner/complete", "testowner/partial"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    warning = next(message for message in capturing.messages if "the saved file UNDERCOUNTS" in message)
+    assert "testowner/partial" in warning
+    assert "testowner/complete" not in warning
+
+
 @patch("stargazers.cli.plt")
 def test_plot_command_account_trend(mock_plt, runner, tmp_path, monkeypatch):
     """Test plotting account trend data from a CSV file."""
