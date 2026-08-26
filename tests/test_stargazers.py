@@ -2517,7 +2517,11 @@ def test_traffic_command_by_day(runner, httpx_mock_non_strict_assertion, tmp_pat
         f"{BASE_API_URL}/repos/testuser/repo2/traffic/popular/referrers",
     ]
 
-    by_day = read_csv_output(tmp_path / f"{username}_traffic_by_day.csv")
+    by_day_file = tmp_path / f"{username}_traffic_by_day.csv"
+    with open(by_day_file, encoding="utf-8") as f:
+        assert next(csv.reader(f)) == ["date", "repo", "views", "unique_views", "clones", "unique_clones"]
+
+    by_day = read_csv_output(by_day_file)
     assert by_day == [
         {
             "date": "2026-07-18",
@@ -2638,6 +2642,41 @@ def test_traffic_command_by_day_clones_unavailable(runner, httpx_mock_non_strict
             "clones": "9",
             "unique_clones": "5",
         },
+    ]
+
+
+def test_traffic_command_by_day_all_clones_unavailable(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    """Every row's clone cells are missing — the nullable-int cast must still render blanks, not crash."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+
+    mock_user_repos_api(httpx_mock, username, [{"full_name": "testuser/repo1", "owner": {"login": username}}])
+    mock_traffic_views_api(
+        httpx_mock,
+        "testuser/repo1",
+        {"count": 5, "uniques": 3, "views": [{"timestamp": "2026-07-18T00:00:00Z", "count": 5, "uniques": 3}]},
+    )
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/testuser/repo1/traffic/clones",
+        method="GET",
+        json={"message": "Forbidden"},
+        status_code=403,
+    )
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo1", [])
+
+    result = runner.invoke(cli, ["traffic", username], catch_exceptions=False)
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+
+    assert read_csv_output(tmp_path / f"{username}_traffic_by_day.csv") == [
+        {
+            "date": "2026-07-18",
+            "repo": "testuser/repo1",
+            "views": "5",
+            "unique_views": "3",
+            "clones": "",
+            "unique_clones": "",
+        }
     ]
 
 
