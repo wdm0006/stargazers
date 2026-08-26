@@ -198,6 +198,10 @@ stargazers account-trend wdm0006 --include-repo scikit-learn-contrib/category_en
 - For the `overview` subcommand: `<username>_repos_overview.csv`.
 - For the `account-trend` subcommand: `<username>_account_stars_by_day.csv`.
   This file will contain columns: `star_date`, `new_stars_on_day`, `cumulative_stars_up_to_day`.
+- For the `traffic` subcommand: `<username>_traffic.csv` (14-day totals per repository),
+  `<username>_traffic_by_day.csv` (one row per repository per day, with columns `date`, `repo`,
+  `views`, `unique_views`, `clones`, `unique_clones`), and `<username>_referrers.csv` when any
+  referrer data was returned.
 
 For `repos` and `forkers`, the CSVs will have a `repo` column indicating the source repository when multiple repositories are processed.
 

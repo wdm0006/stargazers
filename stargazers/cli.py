@@ -657,6 +657,34 @@ def fetch_traffic_referrers(repo: str) -> list | None:
     return response.json()
 
 
+def _daily_traffic_rows(repo: str, views: dict | None, clones: dict | None) -> list[dict]:
+    """
+    Joins one repository's per-day views and clones arrays into a row per calendar day.
+
+    A day present in only one array is zero-filled on the other side. A clones fetch that
+    failed entirely (``clones is None``) leaves the clone columns blank instead of asserting zero.
+    """
+    view_days = {entry["timestamp"][:10]: entry for entry in (views or {}).get("views") or []}
+    clone_days = {entry["timestamp"][:10]: entry for entry in (clones or {}).get("clones") or []}
+    clones_known = clones is not None
+
+    rows = []
+    for date in sorted(set(view_days) | set(clone_days)):
+        view = view_days.get(date)
+        clone = clone_days.get(date)
+        rows.append(
+            {
+                "date": date,
+                "repo": repo,
+                "views": view.get("count", 0) if view else 0,
+                "unique_views": view.get("uniques", 0) if view else 0,
+                "clones": (clone.get("count", 0) if clone else 0) if clones_known else None,
+                "unique_clones": (clone.get("uniques", 0) if clone else 0) if clones_known else None,
+            }
+        )
+    return rows
+
+
 def fetch_user_metadata(users_info: list, timestamp_key: str | None = "starred_at") -> list:
     """
     Fetches detailed metadata for a list of users.
@@ -1430,6 +1458,7 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
     # Collect traffic data across all repos
     repo_views = []
     repo_clones = []
+    traffic_by_day = []
     all_referrers = {}  # referrer -> {count, uniques}
     skipped = 0
     clones_unavailable = []
@@ -1463,6 +1492,7 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
                 "unique_clones": clones.get("uniques", 0) if clones else 0,
             }
         )
+        traffic_by_day.extend(_daily_traffic_rows(repo_name, views, clones))
 
         if referrers:
             for ref in referrers:
@@ -1529,6 +1559,14 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
     output_file = f"{username}_traffic.csv"
     combined_df.to_csv(output_file, index=False)
     console.print(f"\n[green]Saved per-repo traffic data to {output_file}[/]")
+
+    if traffic_by_day:
+        by_day_df = pd.DataFrame(traffic_by_day).sort_values(["date", "repo"])
+        for column in ("clones", "unique_clones"):
+            by_day_df[column] = by_day_df[column].astype("Int64")
+        by_day_output = f"{username}_traffic_by_day.csv"
+        by_day_df.to_csv(by_day_output, index=False)
+        console.print(f"[green]Saved per-day traffic data to {by_day_output}[/]")
 
     if all_referrers:
         ref_output = f"{username}_referrers.csv"

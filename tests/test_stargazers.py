@@ -2434,6 +2434,233 @@ def test_traffic_command(runner, httpx_mock_non_strict_assertion, tmp_path, monk
     assert ref_data[0]["uniques"] == "45"
 
 
+def test_traffic_command_by_day(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    """The per-day breakdown is joined on (repo, date) and costs no extra requests."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+
+    mock_user_repos_api(
+        httpx_mock,
+        username,
+        [
+            {"full_name": "testuser/repo1", "owner": {"login": username}},
+            {"full_name": "testuser/repo2", "owner": {"login": username}},
+        ],
+    )
+
+    # repo1: views on the 18th/19th/20th, clones on the 19th/21st — the 18th, 20th and 21st
+    # each appear in exactly one array and must be zero-filled on the other side.
+    mock_traffic_views_api(
+        httpx_mock,
+        "testuser/repo1",
+        {
+            "count": 23,
+            "uniques": 13,
+            "views": [
+                {"timestamp": "2026-07-18T00:00:00Z", "count": 5, "uniques": 3},
+                {"timestamp": "2026-07-19T00:00:00Z", "count": 7, "uniques": 4},
+                {"timestamp": "2026-07-20T00:00:00Z", "count": 11, "uniques": 6},
+            ],
+        },
+    )
+    mock_traffic_clones_api(
+        httpx_mock,
+        "testuser/repo1",
+        {
+            "count": 30,
+            "uniques": 17,
+            "clones": [
+                {"timestamp": "2026-07-19T00:00:00Z", "count": 13, "uniques": 8},
+                {"timestamp": "2026-07-21T00:00:00Z", "count": 17, "uniques": 9},
+            ],
+        },
+    )
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo1", [])
+
+    # repo2 shares the 19th and the 21st with repo1 but reports different numbers, so a
+    # date-only (repo-blind) join would merge rows and change the values.
+    mock_traffic_views_api(
+        httpx_mock,
+        "testuser/repo2",
+        {
+            "count": 52,
+            "uniques": 26,
+            "views": [
+                {"timestamp": "2026-07-19T00:00:00Z", "count": 23, "uniques": 12},
+                {"timestamp": "2026-07-21T00:00:00Z", "count": 29, "uniques": 14},
+            ],
+        },
+    )
+    mock_traffic_clones_api(
+        httpx_mock,
+        "testuser/repo2",
+        {
+            "count": 31,
+            "uniques": 16,
+            "clones": [{"timestamp": "2026-07-19T00:00:00Z", "count": 31, "uniques": 16}],
+        },
+    )
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo2", [])
+
+    result = runner.invoke(cli, ["traffic", username], catch_exceptions=False)
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+
+    # Same request list as test_traffic_command: one repos page plus three per repository.
+    assert [str(r.url) for r in httpx_mock.get_requests()] == [
+        f"{BASE_API_URL}/users/{username}/repos?type=owner&sort=full_name&per_page={PER_PAGE}&page=1",
+        f"{BASE_API_URL}/repos/testuser/repo1/traffic/views",
+        f"{BASE_API_URL}/repos/testuser/repo1/traffic/clones",
+        f"{BASE_API_URL}/repos/testuser/repo1/traffic/popular/referrers",
+        f"{BASE_API_URL}/repos/testuser/repo2/traffic/views",
+        f"{BASE_API_URL}/repos/testuser/repo2/traffic/clones",
+        f"{BASE_API_URL}/repos/testuser/repo2/traffic/popular/referrers",
+    ]
+
+    by_day = read_csv_output(tmp_path / f"{username}_traffic_by_day.csv")
+    assert by_day == [
+        {
+            "date": "2026-07-18",
+            "repo": "testuser/repo1",
+            "views": "5",
+            "unique_views": "3",
+            "clones": "0",
+            "unique_clones": "0",
+        },
+        {
+            "date": "2026-07-19",
+            "repo": "testuser/repo1",
+            "views": "7",
+            "unique_views": "4",
+            "clones": "13",
+            "unique_clones": "8",
+        },
+        {
+            "date": "2026-07-19",
+            "repo": "testuser/repo2",
+            "views": "23",
+            "unique_views": "12",
+            "clones": "31",
+            "unique_clones": "16",
+        },
+        {
+            "date": "2026-07-20",
+            "repo": "testuser/repo1",
+            "views": "11",
+            "unique_views": "6",
+            "clones": "0",
+            "unique_clones": "0",
+        },
+        {
+            "date": "2026-07-21",
+            "repo": "testuser/repo1",
+            "views": "0",
+            "unique_views": "0",
+            "clones": "17",
+            "unique_clones": "9",
+        },
+        {
+            "date": "2026-07-21",
+            "repo": "testuser/repo2",
+            "views": "29",
+            "unique_views": "14",
+            "clones": "0",
+            "unique_clones": "0",
+        },
+    ]
+
+    # The roll-up CSV still carries GitHub's own totals, unchanged.
+    assert read_csv_output(tmp_path / f"{username}_traffic.csv") == [
+        {"repo": "testuser/repo2", "views": "52", "unique_views": "26", "clones": "31", "unique_clones": "16"},
+        {"repo": "testuser/repo1", "views": "23", "unique_views": "13", "clones": "30", "unique_clones": "17"},
+    ]
+
+
+def test_traffic_command_by_day_clones_unavailable(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    """A repository whose clones fetch fails contributes views rows with BLANK clone columns."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+
+    mock_user_repos_api(
+        httpx_mock,
+        username,
+        [
+            {"full_name": "testuser/repo1", "owner": {"login": username}},
+            {"full_name": "testuser/repo2", "owner": {"login": username}},
+        ],
+    )
+
+    mock_traffic_views_api(
+        httpx_mock,
+        "testuser/repo1",
+        {"count": 5, "uniques": 3, "views": [{"timestamp": "2026-07-18T00:00:00Z", "count": 5, "uniques": 3}]},
+    )
+    # Plain 403: the non-rate-limit skip branch, so fetch_traffic_clones returns None.
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/testuser/repo1/traffic/clones",
+        method="GET",
+        json={"message": "Forbidden"},
+        status_code=403,
+    )
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo1", [])
+
+    mock_traffic_views_api(
+        httpx_mock,
+        "testuser/repo2",
+        {"count": 7, "uniques": 4, "views": [{"timestamp": "2026-07-18T00:00:00Z", "count": 7, "uniques": 4}]},
+    )
+    mock_traffic_clones_api(
+        httpx_mock,
+        "testuser/repo2",
+        {"count": 9, "uniques": 5, "clones": [{"timestamp": "2026-07-18T00:00:00Z", "count": 9, "uniques": 5}]},
+    )
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo2", [])
+
+    result = runner.invoke(cli, ["traffic", username], catch_exceptions=False)
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+
+    by_day = read_csv_output(tmp_path / f"{username}_traffic_by_day.csv")
+    assert by_day == [
+        {
+            "date": "2026-07-18",
+            "repo": "testuser/repo1",
+            "views": "5",
+            "unique_views": "3",
+            "clones": "",
+            "unique_clones": "",
+        },
+        {
+            "date": "2026-07-18",
+            "repo": "testuser/repo2",
+            "views": "7",
+            "unique_views": "4",
+            "clones": "9",
+            "unique_clones": "5",
+        },
+    ]
+
+
+def test_traffic_command_by_day_not_written_without_daily_rows(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    """No repository yielded a daily row -> no per-day CSV, while the roll-up is still written."""
+    httpx_mock = httpx_mock_non_strict_assertion
+    username = "testuser"
+    monkeypatch.chdir(tmp_path)
+
+    mock_user_repos_api(httpx_mock, username, [{"full_name": "testuser/repo1", "owner": {"login": username}}])
+    mock_traffic_views_api(httpx_mock, "testuser/repo1", {"count": 0, "uniques": 0, "views": []})
+    mock_traffic_clones_api(httpx_mock, "testuser/repo1", {"count": 0, "uniques": 0, "clones": []})
+    mock_traffic_referrers_api(httpx_mock, "testuser/repo1", [])
+
+    result = runner.invoke(cli, ["traffic", username], catch_exceptions=False)
+    assert result.exit_code == 0, f"CLI Error: {result.output}"
+
+    assert (tmp_path / f"{username}_traffic.csv").exists()
+    assert not (tmp_path / f"{username}_traffic_by_day.csv").exists()
+
+
 def test_traffic_command_with_exclude(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
     httpx_mock = httpx_mock_non_strict_assertion
     username = "testuser"
