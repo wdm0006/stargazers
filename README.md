@@ -49,6 +49,7 @@ After installation, you can run the CLI from anywhere in your shell using the `s
 *   `issues`: Fetches and analyzes issue and pull-request engagement for one or more repositories.
 *   `releases`: Fetches release cadence and per-release asset download counts for one or more repositories.
 *   `commits`: Fetches commit cadence, merge counts, and author activity for one or more repositories.
+*   `workflows`: Fetches CI workflow run reliability and duration for one or more repositories.
 *   `overview`: Builds a per-repository portfolio snapshot of an account's owned repositories.
 *   `account-trend`: Analyzes star trends over time for all of a user's owned repositories.
 
@@ -133,6 +134,18 @@ Each row contains `sha`, `author_login`, `author_name`, `authored_at`, `committe
 `is_merge`, and `repo`, sorted newest first by author date. Git-only authors remain in the CSV with
 a blank login. The summary reports merge and non-merge totals, the active date range, median commits
 per active day, and top authors. The command uses only the paginated commits list endpoint.
+
+### Analyzing CI Workflow Reliability
+
+```sh
+stargazers workflows <owner/repo> [<owner/repo> ...]
+```
+
+Each row contains `run_id`, `workflow`, `event`, `branch`, `status`, `conclusion`, `run_attempt`,
+`created_at`, `duration_minutes`, and `repo`, sorted newest first. `duration_minutes` runs from
+`run_started_at` to `updated_at` and is blank for runs that have not completed. The summary reports
+success, failure, and cancelled counts, success rate, and median duration per workflow. GitHub returns
+at most about 1000 runs per query, so the export may not cover the full history.
 
 ### Building an Account Portfolio Overview
 

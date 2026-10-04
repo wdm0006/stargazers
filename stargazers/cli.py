@@ -41,6 +41,14 @@ def _days_between(start: str | None, end: str | None) -> float | None:
     return round(delta.total_seconds() / 86400, 2)
 
 
+def _minutes_between(start: str | None, end: str | None) -> float | None:
+    """Minutes (to 2 decimals) between two ISO-8601 timestamps, or None if either is missing."""
+    if not start or not end:
+        return None
+    delta = datetime.fromisoformat(end) - datetime.fromisoformat(start)
+    return round(delta.total_seconds() / 60, 2)
+
+
 def _valid_repo_args(values: tuple[str]) -> list[str]:
     """Drop any value that is not in 'owner/repo' form, logging a warning for each."""
     valid = []
@@ -559,6 +567,74 @@ def fetch_commits(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]
 
     console.log(f"Total commits fetched for {repo}: {len(commit_details)}")
     return commit_details, True
+
+
+def fetch_workflow_runs(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]:
+    """Fetch and flatten a repository's GitHub Actions runs without per-run requests."""
+    console.log(f"[bold blue]Fetching workflow runs for:[/] {repo}")
+    url = f"{GITHUB_API}/repos/{repo}/actions/runs"
+    params = {"per_page": 100, "page": 1}
+    run_details = []
+    rate_limit_retries = 0
+
+    while True:
+        console.log(f"Requesting: {url} with params {params}")
+        try:
+            response = httpx.get(url, headers={**HEADERS, **DEFAULT_HEADERS}, params=params)
+        except httpx.RequestError as e:
+            console.log(
+                f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                f"(network error during pagination: {e})[/]"
+            )
+            return run_details, False
+
+        if skip_missing and response.status_code == 404:
+            console.log(f"[yellow]Repository {repo} not found, skipping workflow run data.[/]")
+            return run_details, False
+
+        error_action = _handle_api_error(response, f"fetching workflow runs for repo {repo}")
+        if error_action == "retry":
+            rate_limit_retries += 1
+            if rate_limit_retries > MAX_RATE_LIMIT_RETRIES:
+                console.log(
+                    f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                    f"(still rate limited after {MAX_RATE_LIMIT_RETRIES} retries)[/]"
+                )
+                return run_details, False
+            continue
+        rate_limit_retries = 0
+
+        batch = response.json().get("workflow_runs") or []
+        console.log(f"Fetched {len(batch)} workflow runs in this batch.")
+        if not batch:
+            break
+
+        for item in batch:
+            completed = item.get("status") == "completed"
+            run_details.append(
+                {
+                    "run_id": item.get("id"),
+                    "workflow": item.get("name"),
+                    "event": item.get("event"),
+                    "branch": item.get("head_branch"),
+                    "status": item.get("status"),
+                    "conclusion": item.get("conclusion"),
+                    "run_attempt": item.get("run_attempt"),
+                    "created_at": item.get("created_at"),
+                    "duration_minutes": _minutes_between(item.get("run_started_at"), item.get("updated_at"))
+                    if completed
+                    else None,
+                }
+            )
+
+        if "next" in response.links:
+            params["page"] += 1
+        else:
+            break
+        time.sleep(0.2)
+
+    console.log(f"Total workflow runs fetched for {repo}: {len(run_details)}")
+    return run_details, True
 
 
 def fetch_traffic_views(repo: str) -> dict | None:
@@ -1160,6 +1236,59 @@ def commits_command(ctx, repositories: tuple[str]):
     summarize_and_save(all_items, base_output_name, "commits", timestamp_key=None)
     _warn_incomplete(incomplete_repos, "commit")
     _summarize_commit_cadence(all_items)
+
+
+def _summarize_workflow_runs(items: list) -> None:
+    """Print per-workflow outcome counts, success rate, and median duration."""
+    console.print("\nWorkflow Run Summary:")
+    console.print(f"Total runs: {len(items)}")
+    console.print("Note: GitHub returns at most ~1000 runs per query, so this may not be the full history.")
+
+    by_workflow = {}
+    for item in items:
+        by_workflow.setdefault(item["workflow"] or "(unnamed)", []).append(item)
+
+    for workflow, runs in sorted(by_workflow.items()):
+        outcomes = Counter(run["conclusion"] for run in runs)
+        finished = sum(outcomes[name] for name in ("success", "failure", "cancelled"))
+        rate = f"{round(100 * outcomes['success'] / finished, 1)}%" if finished else "n/a"
+        durations = pd.Series([run["duration_minutes"] for run in runs if run["duration_minutes"] is not None])
+        median = f"{round(float(durations.median()), 2)} min" if not durations.empty else "n/a"
+        console.print(
+            f"{workflow}: {outcomes['success']} success, {outcomes['failure']} failure, "
+            f"{outcomes['cancelled']} cancelled, success rate {rate}, median duration {median}"
+        )
+
+
+@cli.command("workflows")
+@click.argument("repositories", nargs=-1, required=True)
+@click.pass_context
+def workflows_command(ctx, repositories: tuple[str]):
+    """Fetches and analyzes CI workflow run reliability and duration for one or more repositories."""
+    console.log(f"Command: 'workflows', Args: {repositories}")
+    all_items = []
+    incomplete_repos = []
+    for repo_full_name in repositories:
+        if "/" not in repo_full_name:
+            console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
+            continue
+
+        run_events, complete = fetch_workflow_runs(repo_full_name)
+        if not complete:
+            incomplete_repos.append(repo_full_name)
+        for item in run_events:
+            item["repo"] = repo_full_name
+        all_items.extend(run_events)
+
+    if not all_items:
+        console.log("[yellow]No workflow runs found for any repository.[/]")
+        return
+
+    all_items.sort(key=lambda item: item["created_at"] or "", reverse=True)
+    base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
+    summarize_and_save(all_items, base_output_name, "workflows", timestamp_key=None)
+    _warn_incomplete(incomplete_repos, "workflow run")
+    _summarize_workflow_runs(all_items)
 
 
 def _summarize_repo_portfolio(items: list) -> None:
