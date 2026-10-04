@@ -28,10 +28,6 @@ STAR_HEADERS = {"Accept": "application/vnd.github.v3.star+json"}
 MAX_RATE_LIMIT_RETRIES = 5
 
 
-def _is_rate_limited(response: httpx.Response) -> bool:
-    return response.status_code == 403 and "rate limit" in response.text.lower()
-
-
 def _utcnow() -> datetime:
     """Current UTC time. A seam so tests can pin 'now' when ageing open issues."""
     return datetime.now(timezone.utc)
