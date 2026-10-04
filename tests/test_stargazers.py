@@ -28,6 +28,7 @@ from stargazers.cli import (
     fetch_traffic_views,
     fetch_user_metadata,
     fetch_user_repos,
+    fetch_workflow_runs,
     summarize_and_save,
 )
 
@@ -3192,3 +3193,169 @@ def test_overview_help_documents_options(runner):
     assert "USERNAME" in result.output
     assert "--include-repo" in result.output
     assert "--exclude-repo" in result.output
+
+
+WORKFLOW_HEADER = [
+    "run_id",
+    "workflow",
+    "event",
+    "branch",
+    "status",
+    "conclusion",
+    "run_attempt",
+    "created_at",
+    "duration_minutes",
+    "repo",
+]
+
+
+def _run_payload(run_id, name, created, started, updated, conclusion="success", status="completed"):
+    return {
+        "id": run_id,
+        "name": name,
+        "event": "push",
+        "head_branch": "main",
+        "status": status,
+        "conclusion": conclusion,
+        "run_attempt": 1,
+        "created_at": created,
+        "run_started_at": started,
+        "updated_at": updated,
+        "html_url": f"https://github.com/owner/repo/actions/runs/{run_id}",
+    }
+
+
+def _workflow_runs_url(repo, page=1):
+    return f"{BASE_API_URL}/repos/{repo}/actions/runs?per_page=100&page={page}"
+
+
+WORKFLOW_RUNS_FIXTURE = [
+    _run_payload(
+        6, "Lint", "2024-01-06T10:00:00Z", "2024-01-06T10:00:00Z", "2024-01-06T10:05:00Z", None, "in_progress"
+    ),
+    _run_payload(5, "CI", "2024-01-05T10:00:00Z", "2024-01-05T10:00:00Z", "2024-01-05T10:30:00Z"),
+    _run_payload(4, "Lint", "2024-01-04T10:00:00Z", "2024-01-04T10:00:00Z", "2024-01-04T10:04:00Z", "cancelled"),
+    _run_payload(3, "CI", "2024-01-03T10:00:00Z", "2024-01-03T10:00:00Z", "2024-01-03T10:20:00Z", "failure"),
+    _run_payload(2, "Lint", "2024-01-02T10:00:00Z", "2024-01-02T10:00:00Z", "2024-01-02T10:02:00Z"),
+    _run_payload(1, "CI", "2024-01-01T10:00:00Z", "2024-01-01T10:00:00Z", "2024-01-01T10:10:00Z"),
+]
+
+
+def test_workflows_command_csv_columns_values_and_summary(runner, httpx_mock, tmp_path, monkeypatch):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.chdir(tmp_path)
+    httpx_mock.add_response(
+        url=_workflow_runs_url("owner/repo"),
+        method="GET",
+        json={"total_count": 6, "workflow_runs": WORKFLOW_RUNS_FIXTURE},
+    )
+
+    result = runner.invoke(cli, ["workflows", "owner/repo"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    output_file = tmp_path / "owner_repo_workflows.csv"
+    with open(output_file, encoding="utf-8", newline="") as f:
+        raw_rows = list(csv.reader(f))
+    assert raw_rows[0] == WORKFLOW_HEADER
+    assert [(row[0], row[1], row[5], row[8]) for row in raw_rows[1:]] == [
+        ("6", "Lint", "", ""),
+        ("5", "CI", "success", "30.0"),
+        ("4", "Lint", "cancelled", "4.0"),
+        ("3", "CI", "failure", "20.0"),
+        ("2", "Lint", "success", "2.0"),
+        ("1", "CI", "success", "10.0"),
+    ]
+    assert raw_rows[1][7] == "2024-01-06T10:00:00Z"
+    assert raw_rows[1][9] == "owner/repo"
+    assert "CI: 2 success, 1 failure, 0 cancelled, success rate 66.7%, median duration 20.0 min" in capturing.messages
+    assert "Lint: 1 success, 0 failure, 1 cancelled, success rate 50.0%, median duration 3.0 min" in capturing.messages
+    assert any("at most ~1000 runs" in message for message in capturing.messages)
+    assert not any("UNDERCOUNTS" in message for message in capturing.messages)
+    assert [str(r.url) for r in httpx_mock.get_requests()] == [_workflow_runs_url("owner/repo")]
+
+
+def test_workflows_command_multi_repo_attribution(runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    one = [_run_payload(1, "CI", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-01-01T00:10:00Z")]
+    two = [_run_payload(2, "CI", "2024-01-02T00:00:00Z", "2024-01-02T00:00:00Z", "2024-01-02T00:05:00Z", "failure")]
+    httpx_mock.add_response(url=_workflow_runs_url("owner/one"), json={"workflow_runs": one})
+    httpx_mock.add_response(url=_workflow_runs_url("owner/two"), json={"workflow_runs": two})
+
+    result = runner.invoke(cli, ["workflows", "owner/one", "owner/two"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    rows = read_csv_output(tmp_path / "all_repos_workflows.csv")
+    assert [(row["run_id"], row["repo"], row["conclusion"]) for row in rows] == [
+        ("2", "owner/two", "failure"),
+        ("1", "owner/one", "success"),
+    ]
+
+
+def test_workflows_command_follows_pagination(runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    repo = "owner/repo"
+    first = [_run_payload(2, "CI", "2024-01-02T00:00:00Z", "2024-01-02T00:00:00Z", "2024-01-02T00:01:00Z")]
+    second = [_run_payload(1, "CI", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-01-01T00:02:00Z")]
+    httpx_mock.add_response(
+        url=_workflow_runs_url(repo),
+        json={"workflow_runs": first},
+        headers={"Link": f'<{_workflow_runs_url(repo, 2)}>; rel="next"'},
+    )
+    httpx_mock.add_response(url=_workflow_runs_url(repo, 2), json={"workflow_runs": second})
+
+    result = runner.invoke(cli, ["workflows", repo], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert [row["run_id"] for row in read_csv_output(tmp_path / "owner_repo_workflows.csv")] == ["2", "1"]
+    assert [str(r.url) for r in httpx_mock.get_requests()] == [_workflow_runs_url(repo), _workflow_runs_url(repo, 2)]
+
+
+def test_workflows_command_empty_runs_writes_no_file(runner, httpx_mock, tmp_path, monkeypatch):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.chdir(tmp_path)
+    httpx_mock.add_response(url=_workflow_runs_url("owner/repo"), json={"total_count": 0, "workflow_runs": []})
+
+    result = runner.invoke(cli, ["workflows", "owner/repo"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert list(tmp_path.iterdir()) == []
+    assert "No workflow runs found for any repository." in " ".join(capturing.messages)
+
+
+def test_workflows_command_partial_fetch_saves_rows_and_warns(runner, httpx_mock, tmp_path, monkeypatch):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    monkeypatch.chdir(tmp_path)
+    repo = "owner/repo"
+    runs = [_run_payload(1, "CI", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "2024-01-01T00:03:00Z")]
+    httpx_mock.add_response(
+        url=_workflow_runs_url(repo),
+        json={"workflow_runs": runs},
+        headers={"Link": f'<{_workflow_runs_url(repo, 2)}>; rel="next"'},
+    )
+    httpx_mock.add_exception(httpx.ConnectError("dropped"), url=_workflow_runs_url(repo, 2))
+
+    result = runner.invoke(cli, ["workflows", repo], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert len(read_csv_output(tmp_path / "owner_repo_workflows.csv")) == 1
+    warning = [m for m in capturing.messages if "the saved file UNDERCOUNTS" in m]
+    assert len(warning) == 1
+    assert "workflow run data is incomplete" in warning[0]
+    assert repo in warning[0]
+
+
+def test_fetch_workflow_runs_rate_limit_is_bounded(httpx_mock_non_strict_assertion, no_sleep):
+    httpx_mock_non_strict_assertion.add_response(
+        url=_workflow_runs_url("owner/repo"), status_code=403, text="API rate limit exceeded", is_reusable=True
+    )
+
+    runs, complete = fetch_workflow_runs("owner/repo")
+
+    assert runs == []
+    assert complete is False
+    assert len(httpx_mock_non_strict_assertion.get_requests()) == MAX_RATE_LIMIT_RETRIES + 1
