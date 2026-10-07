@@ -637,6 +637,73 @@ def fetch_workflow_runs(repo: str, *, skip_missing: bool = False) -> tuple[list,
     return run_details, True
 
 
+def fetch_pulls(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]:
+    """Fetch and flatten a repository's pull requests without per-PR requests."""
+    console.log(f"[bold blue]Fetching pull requests for:[/] {repo}")
+    url = f"{GITHUB_API}/repos/{repo}/pulls"
+    params = {"state": "all", "per_page": 100, "page": 1}
+    pull_details = []
+    rate_limit_retries = 0
+
+    while True:
+        console.log(f"Requesting: {url} with params {params}")
+        try:
+            response = httpx.get(url, headers={**HEADERS, **DEFAULT_HEADERS}, params=params)
+        except httpx.RequestError as e:
+            console.log(
+                f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                f"(network error during pagination: {e})[/]"
+            )
+            return pull_details, False
+
+        if skip_missing and response.status_code == 404:
+            console.log(f"[yellow]Repository {repo} not found, skipping pull request data.[/]")
+            return pull_details, False
+
+        error_action = _handle_api_error(response, f"fetching pull requests for repo {repo}")
+        if error_action == "retry":
+            rate_limit_retries += 1
+            if rate_limit_retries > MAX_RATE_LIMIT_RETRIES:
+                console.log(
+                    f"[bold red]WARNING: incomplete data for {repo} — results are partial "
+                    f"(still rate limited after {MAX_RATE_LIMIT_RETRIES} retries)[/]"
+                )
+                return pull_details, False
+            continue
+        rate_limit_retries = 0
+
+        batch = response.json()
+        console.log(f"Fetched {len(batch)} pull requests in this batch.")
+        if not batch:
+            break
+
+        for item in batch:
+            pull_details.append(
+                {
+                    "number": item.get("number"),
+                    "title": item.get("title"),
+                    "author": (item.get("user") or {}).get("login"),
+                    "state": item.get("state"),
+                    "draft": bool(item.get("draft")),
+                    "base_branch": (item.get("base") or {}).get("ref"),
+                    "head_branch": (item.get("head") or {}).get("ref"),
+                    "created_at": item.get("created_at"),
+                    "closed_at": item.get("closed_at"),
+                    "merged_at": item.get("merged_at"),
+                    "days_to_merge": _days_between(item.get("created_at"), item.get("merged_at")),
+                }
+            )
+
+        if "next" in response.links:
+            params["page"] += 1
+        else:
+            break
+        time.sleep(0.2)
+
+    console.log(f"Total pull requests fetched for {repo}: {len(pull_details)}")
+    return pull_details, True
+
+
 def fetch_traffic_views(repo: str) -> dict | None:
     """Fetches traffic view data for a repository (last 14 days). Requires push access."""
     url = f"{GITHUB_API}/repos/{repo}/traffic/views"
@@ -1289,6 +1356,57 @@ def workflows_command(ctx, repositories: tuple[str]):
     summarize_and_save(all_items, base_output_name, "workflows", timestamp_key=None)
     _warn_incomplete(incomplete_repos, "workflow run")
     _summarize_workflow_runs(all_items)
+
+
+def _summarize_pulls(items: list) -> None:
+    """Print open, merged, and closed-unmerged counts plus creation-to-merge duration stats."""
+    merged = [item for item in items if item["merged_at"]]
+    open_count = sum(item["state"] == "open" for item in items)
+    closed_unmerged = sum(item["state"] == "closed" and not item["merged_at"] for item in items)
+    console.print("\nPull Request Summary:")
+    console.print(f"Total pull requests: {len(items)}")
+    console.print(f"Open: {open_count}")
+    console.print(f"Merged: {len(merged)}")
+    console.print(f"Closed without merging: {closed_unmerged}")
+
+    durations = pd.Series([item["days_to_merge"] for item in merged if item["days_to_merge"] is not None])
+    if durations.empty:
+        console.print("No merged pull requests, so days to merge is unavailable.")
+        return
+    console.print("Days to merge is elapsed time from creation to merge, not review time.")
+    console.print(f"Median days to merge: {round(float(durations.median()), 2)}")
+    console.print(f"P90 days to merge: {round(float(durations.quantile(0.9)), 2)}")
+
+
+@cli.command("pulls")
+@click.argument("repositories", nargs=-1, required=True)
+@click.pass_context
+def pulls_command(ctx, repositories: tuple[str]):
+    """Fetches pull request merge outcomes and creation-to-merge time for one or more repositories."""
+    console.log(f"Command: 'pulls', Args: {repositories}")
+    all_items = []
+    incomplete_repos = []
+    for repo_full_name in repositories:
+        if "/" not in repo_full_name:
+            console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
+            continue
+
+        pull_events, complete = fetch_pulls(repo_full_name)
+        if not complete:
+            incomplete_repos.append(repo_full_name)
+        for item in pull_events:
+            item["repo"] = repo_full_name
+        all_items.extend(pull_events)
+
+    if not all_items:
+        console.log("[yellow]No pull requests found for any repository.[/]")
+        return
+
+    all_items.sort(key=lambda item: item["created_at"] or "", reverse=True)
+    base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
+    summarize_and_save(all_items, base_output_name, "pulls", timestamp_key=None)
+    _warn_incomplete(incomplete_repos, "pull request")
+    _summarize_pulls(all_items)
 
 
 def _summarize_repo_portfolio(items: list) -> None:

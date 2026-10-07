@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Add a `pulls` command that exports pull request merge outcomes and creation-to-merge durations (elapsed time, not review time).
+
 ## 0.3.0 - 2026-09-13
 
 ### Added
