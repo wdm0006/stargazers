@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - 2026-10-10
 
 ### Added
 
+- Add a `workflows` command that exports GitHub Actions run outcomes and elapsed durations, and summarizes per-workflow success rate and median duration.
 - Add a `pulls` command that exports pull request merge outcomes and creation-to-merge durations (elapsed time, not review time).
 
 ## 0.3.0 - 2026-09-13
