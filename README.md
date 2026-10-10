@@ -50,6 +50,7 @@ After installation, you can run the CLI from anywhere in your shell using the `s
 *   `releases`: Fetches release cadence and per-release asset download counts for one or more repositories.
 *   `commits`: Fetches commit cadence, merge counts, and author activity for one or more repositories.
 *   `workflows`: Fetches CI workflow run reliability and duration for one or more repositories.
+*   `pulls`: Fetches pull request merge outcomes and creation-to-merge time for one or more repositories.
 *   `overview`: Builds a per-repository portfolio snapshot of an account's owned repositories.
 *   `account-trend`: Analyzes star trends over time for all of a user's owned repositories.
 
@@ -146,6 +147,20 @@ Each row contains `run_id`, `workflow`, `event`, `branch`, `status`, `conclusion
 `run_started_at` to `updated_at` and is blank for runs that have not completed. The summary reports
 success, failure, and cancelled counts, success rate, and median duration per workflow. GitHub returns
 at most about 1000 runs per query, so the export may not cover the full history.
+
+### Analyzing Pull Request Merge Outcomes
+
+```sh
+stargazers pulls <owner/repo> [<owner/repo> ...]
+```
+
+Each row contains `number`, `title`, `author`, `state`, `draft`, `base_branch`, `head_branch`,
+`created_at`, `closed_at`, `merged_at`, `days_to_merge`, and `repo`, sorted newest created first, with
+GitHub's UTC timestamps unchanged. `days_to_merge` is fractional elapsed days from creation to merge; it
+is blank unless the PR was merged, so declined PRs never count as zero. It is elapsed time, not review
+time. The summary reports open, merged, and closed-without-merging counts plus the median and P90 days
+to merge among merged PRs, or says so when none exist. The command is read-only and uses only the
+paginated pull request list endpoint, with no per-PR or per-author requests.
 
 ### Building an Account Portfolio Overview
 

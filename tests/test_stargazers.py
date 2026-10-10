@@ -28,6 +28,7 @@ from stargazers.cli import (
     fetch_traffic_views,
     fetch_user_metadata,
     fetch_user_repos,
+    fetch_pulls,
     fetch_workflow_runs,
     summarize_and_save,
 )
@@ -3357,5 +3358,182 @@ def test_fetch_workflow_runs_rate_limit_is_bounded(httpx_mock_non_strict_asserti
     runs, complete = fetch_workflow_runs("owner/repo")
 
     assert runs == []
+    assert complete is False
+    assert len(httpx_mock_non_strict_assertion.get_requests()) == MAX_RATE_LIMIT_RETRIES + 1
+
+
+PULLS_HEADER = [
+    "number",
+    "title",
+    "author",
+    "state",
+    "draft",
+    "base_branch",
+    "head_branch",
+    "created_at",
+    "closed_at",
+    "merged_at",
+    "days_to_merge",
+    "repo",
+]
+
+
+def _pull_payload(number, created, state="open", closed=None, merged=None, draft=False, login="alice"):
+    return {
+        "number": number,
+        "title": f"PR {number}",
+        "state": state,
+        "draft": draft,
+        "user": {"login": login} if login else None,
+        "base": {"ref": "main"},
+        "head": {"ref": f"feature-{number}"},
+        "created_at": created,
+        "closed_at": closed,
+        "merged_at": merged,
+    }
+
+
+def _pulls_url(repo, page=1):
+    return f"{BASE_API_URL}/repos/{repo}/pulls?state=all&per_page=100&page={page}"
+
+
+PULLS_FIXTURE = [
+    _pull_payload(5, "2024-01-05T00:00:00Z", draft=True, login=None),
+    _pull_payload(4, "2024-01-04T00:00:00Z"),
+    _pull_payload(3, "2024-01-03T00:00:00Z", "closed", "2024-01-05T12:00:00Z", "2024-01-05T12:00:00Z", login="bob"),
+    _pull_payload(2, "2024-01-02T00:00:00Z", "closed", "2024-01-12T00:00:00Z"),
+    _pull_payload(1, "2024-01-01T00:00:00Z", "closed", "2024-01-02T00:00:00Z", "2024-01-02T00:00:00Z"),
+]
+
+
+def test_pulls_command_csv_values_and_summary(runner, httpx_mock, tmp_path, monkeypatch):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.chdir(tmp_path)
+    httpx_mock.add_response(url=_pulls_url("owner/repo"), json=PULLS_FIXTURE)
+
+    result = runner.invoke(cli, ["pulls", "owner/repo"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    output_file = tmp_path / "owner_repo_pulls.csv"
+    with open(output_file, newline="") as f:
+        assert next(csv.reader(f)) == PULLS_HEADER
+    rows = read_csv_output(output_file)
+    assert [r["number"] for r in rows] == ["5", "4", "3", "2", "1"]
+    by_number = {r["number"]: r for r in rows}
+    assert by_number["5"]["draft"] == "True"
+    assert by_number["5"]["author"] == ""
+    assert by_number["5"]["days_to_merge"] == ""
+    assert by_number["4"]["draft"] == "False"
+    assert by_number["3"]["days_to_merge"] == "2.5"
+    assert by_number["3"]["merged_at"] == "2024-01-05T12:00:00Z"
+    assert by_number["3"]["base_branch"] == "main"
+    assert by_number["3"]["head_branch"] == "feature-3"
+    assert by_number["2"]["closed_at"] == "2024-01-12T00:00:00Z"
+    assert by_number["2"]["merged_at"] == ""
+    assert by_number["2"]["days_to_merge"] == ""
+    assert by_number["1"]["days_to_merge"] == "1.0"
+    assert by_number["1"]["repo"] == "owner/repo"
+    assert by_number["1"]["created_at"] == "2024-01-01T00:00:00Z"
+
+    messages = capturing.messages
+    assert "Open: 2" in messages
+    assert "Merged: 2" in messages
+    assert "Closed without merging: 1" in messages
+    assert "Median days to merge: 1.75" in messages
+    assert "P90 days to merge: 2.35" in messages
+    assert not [m for m in messages if "UNDERCOUNTS" in m]
+    assert [str(r.url) for r in httpx_mock.get_requests()] == [_pulls_url("owner/repo")]
+
+
+def test_pulls_command_without_merged_prs_reports_unavailable(runner, httpx_mock, tmp_path, monkeypatch):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.chdir(tmp_path)
+    payload = [
+        _pull_payload(2, "2024-01-02T00:00:00Z"),
+        _pull_payload(1, "2024-01-01T00:00:00Z", "closed", "2024-01-03T00:00:00Z"),
+    ]
+    httpx_mock.add_response(url=_pulls_url("owner/repo"), json=payload)
+
+    result = runner.invoke(cli, ["pulls", "owner/repo"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert "Merged: 0" in capturing.messages
+    assert "Closed without merging: 1" in capturing.messages
+    assert "No merged pull requests, so days to merge is unavailable." in capturing.messages
+    assert not [m for m in capturing.messages if "Median days to merge" in m]
+
+
+def test_pulls_command_multi_repo_attribution_and_pagination(runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    one = [_pull_payload(2, "2024-01-04T00:00:00Z")]
+    one_page2 = [_pull_payload(1, "2024-01-01T00:00:00Z", "closed", "2024-01-02T00:00:00Z", "2024-01-02T00:00:00Z")]
+    two = [_pull_payload(7, "2024-01-03T00:00:00Z")]
+    httpx_mock.add_response(
+        url=_pulls_url("owner/one"),
+        json=one,
+        headers={"Link": f'<{_pulls_url("owner/one", 2)}>; rel="next"'},
+    )
+    httpx_mock.add_response(url=_pulls_url("owner/one", 2), json=one_page2)
+    httpx_mock.add_response(url=_pulls_url("owner/two"), json=two)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+
+    result = runner.invoke(cli, ["pulls", "owner/one", "owner/two"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    rows = read_csv_output(tmp_path / "all_repos_pulls.csv")
+    assert [(r["repo"], r["number"]) for r in rows] == [("owner/one", "2"), ("owner/two", "7"), ("owner/one", "1")]
+    assert [str(r.url) for r in httpx_mock.get_requests()] == [
+        _pulls_url("owner/one"),
+        _pulls_url("owner/one", 2),
+        _pulls_url("owner/two"),
+    ]
+
+
+def test_pulls_command_empty_writes_no_file(runner, httpx_mock, tmp_path, monkeypatch):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.chdir(tmp_path)
+    httpx_mock.add_response(url=_pulls_url("owner/repo"), json=[])
+
+    result = runner.invoke(cli, ["pulls", "owner/repo"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert list(tmp_path.iterdir()) == []
+    assert "No pull requests found for any repository." in " ".join(capturing.messages)
+
+
+def test_pulls_command_partial_fetch_saves_rows_and_warns(runner, httpx_mock, tmp_path, monkeypatch):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    monkeypatch.chdir(tmp_path)
+    repo = "owner/repo"
+    httpx_mock.add_response(
+        url=_pulls_url(repo),
+        json=[_pull_payload(1, "2024-01-01T00:00:00Z")],
+        headers={"Link": f'<{_pulls_url(repo, 2)}>; rel="next"'},
+    )
+    httpx_mock.add_exception(httpx.ConnectError("dropped"), url=_pulls_url(repo, 2))
+
+    result = runner.invoke(cli, ["pulls", repo], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert len(read_csv_output(tmp_path / "owner_repo_pulls.csv")) == 1
+    warning = [m for m in capturing.messages if "the saved file UNDERCOUNTS" in m]
+    assert len(warning) == 1
+    assert "pull request data is incomplete" in warning[0]
+    assert repo in warning[0]
+
+
+def test_fetch_pulls_rate_limit_is_bounded(httpx_mock_non_strict_assertion, no_sleep):
+    httpx_mock_non_strict_assertion.add_response(
+        url=_pulls_url("owner/repo"), status_code=403, text="API rate limit exceeded", is_reusable=True
+    )
+
+    pulls, complete = fetch_pulls("owner/repo")
+
+    assert pulls == []
     assert complete is False
     assert len(httpx_mock_non_strict_assertion.get_requests()) == MAX_RATE_LIMIT_RETRIES + 1
