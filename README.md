@@ -82,6 +82,17 @@ stargazers forkers wdm0006/pygeohash wdm0006/elote
 stargazers contributors <owner/repo> [<owner/repo> ...]
 ```
 
+### Skipping per-user profile lookups
+
+`repos`, `forkers` and `contributors` make one `GET /users/{login}` request per person by default.
+Pass `--no-profiles` to skip those requests and use only the list payload (`login`, the
+`starred_at`/`forked_at`/`contributions` value, `repo`). The profile columns stay in the CSV but are
+blank, and the location ranking is replaced by a "no profile data" note.
+
+```sh
+stargazers repos --no-profiles <owner/repo>
+```
+
 ### Analyzing Issue and Pull Request Engagement
 
 ```sh
