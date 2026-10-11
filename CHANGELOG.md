@@ -6,6 +6,7 @@
 
 - Add a `workflows` command that exports GitHub Actions run outcomes and elapsed durations, and summarizes per-workflow success rate and median duration.
 - Add a `pulls` command that exports pull request merge outcomes and creation-to-merge durations (elapsed time, not review time).
+- Add `--since` and `--until` (UTC `YYYY-MM-DD`, inclusive) to `issues`, `pulls`, `commits`, `releases` and `workflows` to restrict exports and summaries to a time window.
 
 ## 0.3.0 - 2026-09-13
 
