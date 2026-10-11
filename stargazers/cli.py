@@ -60,6 +60,69 @@ def _valid_repo_args(values: tuple[str]) -> list[str]:
     return valid
 
 
+def _window_options(func):
+    """Add the shared ``--since`` / ``--until`` options to a command."""
+    func = click.option(
+        "--until",
+        "until",
+        type=click.DateTime(formats=["%Y-%m-%d"]),
+        default=None,
+        help="Only include records on or before this UTC date (YYYY-MM-DD, inclusive).",
+    )(func)
+    return click.option(
+        "--since",
+        "since",
+        type=click.DateTime(formats=["%Y-%m-%d"]),
+        default=None,
+        help="Only include records on or after this UTC date (YYYY-MM-DD, inclusive).",
+    )(func)
+
+
+def _parse_window(since: datetime | None, until: datetime | None) -> tuple[str | None, str | None] | None:
+    """Return the validated ``(since, until)`` window as ISO dates, or None when neither bound is set."""
+    if since is None and until is None:
+        return None
+    if since is not None and until is not None and since > until:
+        raise click.UsageError(f"--since ({since.date()}) must not be after --until ({until.date()}).")
+    return (since.date().isoformat() if since else None, until.date().isoformat() if until else None)
+
+
+def _in_window(timestamp: str | None, window: tuple[str | None, str | None] | None) -> bool:
+    """True when the ISO-8601 UTC timestamp's calendar day falls inside the window (always true without one)."""
+    if window is None:
+        return True
+    if not timestamp:
+        return False
+    day = timestamp[:10]
+    lower, upper = window
+    return (lower is None or day >= lower) and (upper is None or day <= upper)
+
+
+def _filter_window(items: list, field: str, window: tuple[str | None, str | None] | None) -> list:
+    """Keep the records whose ``field`` timestamp is inside the window."""
+    if window is None:
+        return items
+    return [item for item in items if _in_window(item.get(field), window)]
+
+
+def _describe_window(field: str, window: tuple[str | None, str | None] | None) -> str:
+    lower, upper = window or (None, None)
+    return f"{field} from {lower or 'the beginning'} to {upper or 'today'} (inclusive, UTC)"
+
+
+def _print_window(field: str, window: tuple[str | None, str | None] | None) -> None:
+    if window is not None:
+        console.print(f"\nWindow: filtered on {_describe_window(field, window)}")
+
+
+def _created_range(window: tuple[str | None, str | None]) -> str:
+    """GitHub search-style date range for the workflow-runs ``created`` filter."""
+    lower, upper = window
+    if lower and upper:
+        return f"{lower}..{upper}"
+    return f">={lower}" if lower else f"<={upper}"
+
+
 def _is_rate_limited(response: httpx.Response) -> bool:
     """True for GitHub's rate-limit rejection: a 403 whose body mentions the rate limit."""
     return response.status_code == 403 and "rate limit" in response.text.lower()
@@ -353,7 +416,9 @@ def fetch_contributors(repo: str, *, skip_missing: bool = False) -> tuple[list, 
     return contributor_details, True
 
 
-def fetch_issues(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]:
+def fetch_issues(
+    repo: str, *, skip_missing: bool = False, window: tuple[str | None, str | None] | None = None
+) -> tuple[list, bool]:
     """Fetch issues and pull requests for a repo.
 
     GitHub's ``/issues`` endpoint returns pull requests mixed in with issues; an item
@@ -363,6 +428,8 @@ def fetch_issues(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]:
     console.log(f"[bold blue]Fetching issues for:[/] {repo}")
     url = f"{GITHUB_API}/repos/{repo}/issues"
     params = {"state": "all", "per_page": 100, "page": 1}
+    if window and window[0]:
+        params["since"] = f"{window[0]}T00:00:00Z"
     issue_details = []
     rate_limit_retries = 0
 
@@ -503,11 +570,15 @@ def fetch_releases(repo: str, *, skip_missing: bool = False) -> tuple[list, bool
     return release_details, True
 
 
-def fetch_commits(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]:
+def fetch_commits(
+    repo: str, *, skip_missing: bool = False, window: tuple[str | None, str | None] | None = None
+) -> tuple[list, bool]:
     """Fetch and flatten a repository's commits without per-commit requests."""
     console.log(f"[bold blue]Fetching commits for:[/] {repo}")
     url = f"{GITHUB_API}/repos/{repo}/commits"
     params = {"per_page": 100, "page": 1}
+    if window and window[0]:
+        params["since"] = f"{window[0]}T00:00:00Z"
     commit_details = []
     rate_limit_retries = 0
 
@@ -569,11 +640,15 @@ def fetch_commits(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]
     return commit_details, True
 
 
-def fetch_workflow_runs(repo: str, *, skip_missing: bool = False) -> tuple[list, bool]:
+def fetch_workflow_runs(
+    repo: str, *, skip_missing: bool = False, window: tuple[str | None, str | None] | None = None
+) -> tuple[list, bool]:
     """Fetch and flatten a repository's GitHub Actions runs without per-run requests."""
     console.log(f"[bold blue]Fetching workflow runs for:[/] {repo}")
     url = f"{GITHUB_API}/repos/{repo}/actions/runs"
     params = {"per_page": 100, "page": 1}
+    if window:
+        params["created"] = _created_range(window)
     run_details = []
     rate_limit_retries = 0
 
@@ -1184,10 +1259,12 @@ def _summarize_issue_engagement(items: list) -> None:
 
 @cli.command("issues")
 @click.argument("repositories", nargs=-1, required=True)
+@_window_options
 @click.pass_context
-def issues_command(ctx, repositories: tuple[str]):
+def issues_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None):
     """Fetches and analyzes ISSUE and PULL REQUEST engagement for one or more repositories."""
     console.log(f"Command: 'issues', Args: {repositories}")
+    window = _parse_window(since, until)
     all_items = []
     incomplete_repos = []
     for repo_full_name in repositories:
@@ -1195,9 +1272,10 @@ def issues_command(ctx, repositories: tuple[str]):
             console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
             continue
 
-        issue_events, complete = fetch_issues(repo_full_name)
+        issue_events, complete = fetch_issues(repo_full_name, window=window)
         if not complete:
             incomplete_repos.append(repo_full_name)
+        issue_events = _filter_window(issue_events, "created_at", window)
         for item in issue_events:
             item["days_to_close"] = _days_between(item["created_at"], item["closed_at"])
             item["repo"] = repo_full_name
@@ -1213,6 +1291,7 @@ def issues_command(ctx, repositories: tuple[str]):
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
     summarize_and_save(all_items, base_output_name, "issues", timestamp_key=None)
     _warn_incomplete(incomplete_repos, "issue and pull request")
+    _print_window("created_at", window)
     _summarize_issue_engagement(all_items)
 
 
@@ -1253,10 +1332,12 @@ def _summarize_release_cadence(items: list) -> None:
 
 @cli.command("releases")
 @click.argument("repositories", nargs=-1, required=True)
+@_window_options
 @click.pass_context
-def releases_command(ctx, repositories: tuple[str]):
+def releases_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None):
     """Fetches and analyzes RELEASE cadence and asset downloads for one or more repositories."""
     console.log(f"Command: 'releases', Args: {repositories}")
+    window = _parse_window(since, until)
     all_items = []
     incomplete_repos = []
     for repo_full_name in repositories:
@@ -1269,6 +1350,7 @@ def releases_command(ctx, repositories: tuple[str]):
             incomplete_repos.append(repo_full_name)
         # Per repository, before these events join the shared list.
         _apply_days_since_previous(release_events)
+        release_events = _filter_window(release_events, "published_at", window)
         for item in release_events:
             item["repo"] = repo_full_name
         all_items.extend(release_events)
@@ -1283,6 +1365,7 @@ def releases_command(ctx, repositories: tuple[str]):
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
     summarize_and_save(all_items, base_output_name, "releases", timestamp_key=None)
     _warn_incomplete(incomplete_repos, "release")
+    _print_window("published_at", window)
     _summarize_release_cadence(all_items)
 
 
@@ -1310,10 +1393,12 @@ def _summarize_commit_cadence(items: list) -> None:
 
 @cli.command("commits")
 @click.argument("repositories", nargs=-1, required=True)
+@_window_options
 @click.pass_context
-def commits_command(ctx, repositories: tuple[str]):
+def commits_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None):
     """Fetches and analyzes COMMIT cadence and authors for one or more repositories."""
     console.log(f"Command: 'commits', Args: {repositories}")
+    window = _parse_window(since, until)
     all_items = []
     incomplete_repos = []
     for repo_full_name in repositories:
@@ -1321,9 +1406,10 @@ def commits_command(ctx, repositories: tuple[str]):
             console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
             continue
 
-        commit_events, complete = fetch_commits(repo_full_name)
+        commit_events, complete = fetch_commits(repo_full_name, window=window)
         if not complete:
             incomplete_repos.append(repo_full_name)
+        commit_events = _filter_window(commit_events, "authored_at", window)
         for item in commit_events:
             item["repo"] = repo_full_name
         all_items.extend(commit_events)
@@ -1336,6 +1422,7 @@ def commits_command(ctx, repositories: tuple[str]):
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
     summarize_and_save(all_items, base_output_name, "commits", timestamp_key=None)
     _warn_incomplete(incomplete_repos, "commit")
+    _print_window("authored_at", window)
     _summarize_commit_cadence(all_items)
 
 
@@ -1363,10 +1450,12 @@ def _summarize_workflow_runs(items: list) -> None:
 
 @cli.command("workflows")
 @click.argument("repositories", nargs=-1, required=True)
+@_window_options
 @click.pass_context
-def workflows_command(ctx, repositories: tuple[str]):
+def workflows_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None):
     """Fetches and analyzes CI workflow run reliability and duration for one or more repositories."""
     console.log(f"Command: 'workflows', Args: {repositories}")
+    window = _parse_window(since, until)
     all_items = []
     incomplete_repos = []
     for repo_full_name in repositories:
@@ -1374,9 +1463,10 @@ def workflows_command(ctx, repositories: tuple[str]):
             console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
             continue
 
-        run_events, complete = fetch_workflow_runs(repo_full_name)
+        run_events, complete = fetch_workflow_runs(repo_full_name, window=window)
         if not complete:
             incomplete_repos.append(repo_full_name)
+        run_events = _filter_window(run_events, "created_at", window)
         for item in run_events:
             item["repo"] = repo_full_name
         all_items.extend(run_events)
@@ -1389,6 +1479,7 @@ def workflows_command(ctx, repositories: tuple[str]):
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
     summarize_and_save(all_items, base_output_name, "workflows", timestamp_key=None)
     _warn_incomplete(incomplete_repos, "workflow run")
+    _print_window("created_at", window)
     _summarize_workflow_runs(all_items)
 
 
@@ -1414,10 +1505,12 @@ def _summarize_pulls(items: list) -> None:
 
 @cli.command("pulls")
 @click.argument("repositories", nargs=-1, required=True)
+@_window_options
 @click.pass_context
-def pulls_command(ctx, repositories: tuple[str]):
+def pulls_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None):
     """Fetches pull request merge outcomes and creation-to-merge time for one or more repositories."""
     console.log(f"Command: 'pulls', Args: {repositories}")
+    window = _parse_window(since, until)
     all_items = []
     incomplete_repos = []
     for repo_full_name in repositories:
@@ -1428,6 +1521,7 @@ def pulls_command(ctx, repositories: tuple[str]):
         pull_events, complete = fetch_pulls(repo_full_name)
         if not complete:
             incomplete_repos.append(repo_full_name)
+        pull_events = _filter_window(pull_events, "created_at", window)
         for item in pull_events:
             item["repo"] = repo_full_name
         all_items.extend(pull_events)
@@ -1440,6 +1534,7 @@ def pulls_command(ctx, repositories: tuple[str]):
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
     summarize_and_save(all_items, base_output_name, "pulls", timestamp_key=None)
     _warn_incomplete(incomplete_repos, "pull request")
+    _print_window("created_at", window)
     _summarize_pulls(all_items)
 
 
