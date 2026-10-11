@@ -824,6 +824,32 @@ def _daily_traffic_rows(repo: str, views: dict | None, clones: dict | None) -> l
     return rows
 
 
+PROFILE_FIELDS = ("name", "company", "location", "email", "bio", "followers", "public_repos")
+
+
+def basic_user_rows(users_info: list, timestamp_key: str | None) -> list:
+    """Build rows from list-payload fields only, with the profile columns present but blank."""
+    rows = []
+    for user_event in users_info:
+        row = {"login": user_event["login"]}
+        row.update(dict.fromkeys(PROFILE_FIELDS))
+        if timestamp_key is not None:
+            row[timestamp_key] = user_event[timestamp_key]
+        if "contributions" in user_event:
+            row["contributions"] = user_event["contributions"]
+        if "repo" in user_event:
+            row["repo"] = user_event["repo"]
+        rows.append(row)
+    return rows
+
+
+no_profiles_option = click.option(
+    "--no-profiles",
+    is_flag=True,
+    help="Skip the per-user GET /users/{login} lookups; profile columns are left blank.",
+)
+
+
 def fetch_user_metadata(users_info: list, timestamp_key: str | None = "starred_at") -> list:
     """
     Fetches detailed metadata for a list of users.
@@ -942,6 +968,8 @@ def summarize_and_save(data: list, base_name: str, output_file_suffix: str, time
         if not top_locs.empty:
             console.print("\nTop Locations:")
             console.print(top_locs)
+        elif df["location"].isna().all():
+            console.print("\nNo profile data (locations are blank).")
     elif not df.empty and "total_new_stars_on_day" in df.columns:  # Account trend specific summary
         console.print("\nStar Trend Summary:")
         console.print(f"Date range: {df['star_date'].min()} to {df['star_date'].max()}")
@@ -1008,8 +1036,9 @@ def cli():
 
 @cli.command("repos")
 @click.argument("repositories", nargs=-1, required=True)
+@no_profiles_option
 @click.pass_context
-def stargazers_repos_command(ctx, repositories: tuple[str]):
+def stargazers_repos_command(ctx, repositories: tuple[str], no_profiles: bool):
     """Fetches and analyzes STARGÀZERS for one or more repositories."""
     console.log(f"Command: 'repos', Args: {repositories}")
     all_metadata = []
@@ -1029,7 +1058,8 @@ def stargazers_repos_command(ctx, repositories: tuple[str]):
         for sg_event in stargazer_events:
             sg_event["repo"] = repo_full_name
 
-        metadata = fetch_user_metadata(stargazer_events, timestamp_key="starred_at")
+        enrich = basic_user_rows if no_profiles else fetch_user_metadata
+        metadata = enrich(stargazer_events, "starred_at")
         all_metadata.extend(metadata)
 
     if not all_metadata:
@@ -1047,8 +1077,9 @@ def stargazers_repos_command(ctx, repositories: tuple[str]):
 
 @cli.command("forkers")
 @click.argument("repositories", nargs=-1, required=True)
+@no_profiles_option
 @click.pass_context
-def forkers_command(ctx, repositories: tuple[str]):
+def forkers_command(ctx, repositories: tuple[str], no_profiles: bool):
     """Fetches and analyzes FORKERS for one or more repositories."""
     console.log(f"Command: 'forkers', Args: {repositories}")
     all_metadata = []
@@ -1066,7 +1097,8 @@ def forkers_command(ctx, repositories: tuple[str]):
         for fk_event in forker_events:
             fk_event["repo"] = repo_full_name
 
-        metadata = fetch_user_metadata(forker_events, timestamp_key="forked_at")
+        enrich = basic_user_rows if no_profiles else fetch_user_metadata
+        metadata = enrich(forker_events, "forked_at")
         all_metadata.extend(metadata)
 
     if not all_metadata:
@@ -1084,8 +1116,9 @@ def forkers_command(ctx, repositories: tuple[str]):
 
 @cli.command("contributors")
 @click.argument("repositories", nargs=-1, required=True)
+@no_profiles_option
 @click.pass_context
-def contributors_command(ctx, repositories: tuple[str]):
+def contributors_command(ctx, repositories: tuple[str], no_profiles: bool):
     """Fetches and analyzes CONTRIBUTORS for one or more repositories."""
     console.log(f"Command: 'contributors', Args: {repositories}")
     all_metadata = []
@@ -1101,7 +1134,8 @@ def contributors_command(ctx, repositories: tuple[str]):
         for contributor_event in contributor_events:
             contributor_event["repo"] = repo_full_name
 
-        all_metadata.extend(fetch_user_metadata(contributor_events, timestamp_key=None))
+        enrich = basic_user_rows if no_profiles else fetch_user_metadata
+        all_metadata.extend(enrich(contributor_events, None))
 
     if not all_metadata:
         console.log("[yellow]No contributors found for any repository.[/]")

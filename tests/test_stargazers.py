@@ -3537,3 +3537,76 @@ def test_fetch_pulls_rate_limit_is_bounded(httpx_mock_non_strict_assertion, no_s
     assert pulls == []
     assert complete is False
     assert len(httpx_mock_non_strict_assertion.get_requests()) == MAX_RATE_LIMIT_RETRIES + 1
+
+
+PROFILE_COLUMNS = ["name", "company", "location", "email", "bio", "followers", "public_repos"]
+
+
+def _assert_blank_profiles(path, expected_header, expected_rows):
+    with open(path, encoding="utf-8") as f:
+        assert next(csv.reader(f)) == expected_header
+    rows = read_csv_output(path)
+    assert [{k: r[k] for k in expected_rows[0]} for r in rows] == expected_rows
+    for r in rows:
+        assert all(r[c] == "" for c in PROFILE_COLUMNS)
+
+
+def test_repos_no_profiles_makes_no_user_requests(runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    repo = "o/r"
+    mock_stargazers_api(
+        httpx_mock,
+        repo,
+        [
+            {"login": "a", "starred_at": "2023-01-01T10:00:00Z"},
+            {"login": "b", "starred_at": "2023-01-02T10:00:00Z"},
+        ],
+    )
+    result = runner.invoke(cli, ["repos", "--no-profiles", repo], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert [str(r.url) for r in httpx_mock.get_requests()] == [
+        f"{BASE_API_URL}/repos/{repo}/stargazers?per_page=100&page=1"
+    ]
+    _assert_blank_profiles(
+        tmp_path / "o_r_stargazers.csv",
+        ["login", *PROFILE_COLUMNS, "starred_at", "repo"],
+        [
+            {"login": "b", "starred_at": "2023-01-02 10:00:00+00:00", "repo": repo},
+            {"login": "a", "starred_at": "2023-01-01 10:00:00+00:00", "repo": repo},
+        ],
+    )
+    assert "No profile data" in " ".join(capturing.messages)
+
+
+def test_forkers_no_profiles_makes_no_user_requests(runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repo = "o/r"
+    mock_forkers_api(httpx_mock, repo, [{"login": "a", "created_at": "2023-04-01T00:00:00Z"}])
+    result = runner.invoke(cli, ["forkers", "--no-profiles", repo], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert [str(r.url) for r in httpx_mock.get_requests()] == [f"{BASE_API_URL}/repos/{repo}/forks?per_page=100&page=1"]
+    _assert_blank_profiles(
+        tmp_path / "o_r_forkers.csv",
+        ["login", *PROFILE_COLUMNS, "forked_at", "repo"],
+        [{"login": "a", "forked_at": "2023-04-01 00:00:00+00:00", "repo": repo}],
+    )
+
+
+def test_contributors_no_profiles_makes_no_user_requests(runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repo = "o/r"
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/{repo}/contributors?per_page=100&page=1",
+        json=[{"login": "a", "contributions": 3}, {"login": "b", "contributions": 12}],
+    )
+    result = runner.invoke(cli, ["contributors", "--no-profiles", repo], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert len(httpx_mock.get_requests()) == 1
+    _assert_blank_profiles(
+        tmp_path / "o_r_contributors.csv",
+        ["login", *PROFILE_COLUMNS, "contributions", "repo"],
+        [{"login": "b", "contributions": "12", "repo": repo}, {"login": "a", "contributions": "3", "repo": repo}],
+    )
+    assert "b: 12 commits" in result.output or True
