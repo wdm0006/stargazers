@@ -3537,3 +3537,171 @@ def test_fetch_pulls_rate_limit_is_bounded(httpx_mock_non_strict_assertion, no_s
     assert pulls == []
     assert complete is False
     assert len(httpx_mock_non_strict_assertion.get_requests()) == MAX_RATE_LIMIT_RETRIES + 1
+
+
+WINDOW_STAMPS = [
+    "2024-02-01T00:00:00Z",  # day after the window
+    "2024-01-31T23:59:59Z",  # last second of the final day
+    "2024-01-15T12:00:00Z",
+    "2024-01-01T00:00:00Z",  # first second of the first day
+    "2023-12-31T23:59:59Z",  # day before the window
+]
+WINDOW_CASES = {
+    "issues": {
+        "url": lambda repo, extra: f"{BASE_API_URL}/repos/{repo}/issues?state=all&per_page=100&page=1{extra}",
+        "body": lambda: [
+            _issue_payload(i, created_at=stamp, state="open") for i, stamp in zip("54321", WINDOW_STAMPS, strict=True)
+        ],
+        "id": "number",
+        "field": "created_at",
+        "server": "&since=2024-01-01T00:00:00Z",
+    },
+    "pulls": {
+        "url": lambda repo, extra: f"{BASE_API_URL}/repos/{repo}/pulls?state=all&per_page=100&page=1{extra}",
+        "body": lambda: [_pull_payload(i, stamp) for i, stamp in zip("54321", WINDOW_STAMPS, strict=True)],
+        "id": "number",
+        "field": "created_at",
+        "server": "",
+    },
+    "releases": {
+        "url": lambda repo, extra: f"{BASE_API_URL}/repos/{repo}/releases?per_page=100&page=1{extra}",
+        "body": lambda: [
+            _release_payload(f"v{i}", published_at=stamp) for i, stamp in zip("54321", WINDOW_STAMPS, strict=True)
+        ],
+        "id": "tag_name",
+        "field": "published_at",
+        "server": "",
+    },
+    "commits": {
+        "url": lambda repo, extra: f"{BASE_API_URL}/repos/{repo}/commits?per_page=100&page=1{extra}",
+        "body": lambda: [
+            _commit_payload(f"sha{i}", name="Alice", authored_at=stamp)
+            for i, stamp in zip("54321", WINDOW_STAMPS, strict=True)
+        ],
+        "id": "sha",
+        "field": "authored_at",
+        "server": "&since=2024-01-01T00:00:00Z",
+    },
+    "workflows": {
+        "url": lambda repo, extra: f"{BASE_API_URL}/repos/{repo}/actions/runs?per_page=100&page=1{extra}",
+        "body": lambda: {
+            "workflow_runs": [
+                _run_payload(int(i), "CI", stamp, stamp, stamp) for i, stamp in zip("54321", WINDOW_STAMPS, strict=True)
+            ]
+        },
+        "id": "run_id",
+        "field": "created_at",
+        "server": "&created=2024-01-01..2024-01-31",
+    },
+}
+
+
+def _window_ids(command, numbers):
+    prefix = {"releases": "v", "commits": "sha"}.get(command, "")
+    return [f"{prefix}{n}" for n in numbers]
+
+
+# (flags, server-side query suffix per command, ids kept newest-first)
+WINDOW_BOUND_CASES = [
+    (["--since", "2024-01-01", "--until", "2024-01-31"], {"server": None}, "432"),
+    (["--since", "2024-01-01"], {"workflows": "&created=>=2024-01-01"}, "5432"),
+    (["--until", "2024-01-15"], {"workflows": "&created=<=2024-01-15", "issues": "", "commits": ""}, "321"),
+]
+
+
+@pytest.mark.parametrize("command", list(WINDOW_CASES))
+@pytest.mark.parametrize("flags, overrides, kept", WINDOW_BOUND_CASES)
+def test_window_keeps_exactly_in_window_rows(
+    command, flags, overrides, kept, runner, httpx_mock, tmp_path, monkeypatch
+):
+    case = WINDOW_CASES[command]
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.chdir(tmp_path)
+    if "server" in overrides:
+        extra = case["server"]
+    elif command in overrides:
+        extra = overrides[command]
+    else:
+        extra = case["server"] if command in ("issues", "commits") and flags[0] == "--since" else ""
+    httpx_mock.add_response(url=case["url"]("owner/repo", extra), json=case["body"]())
+
+    result = runner.invoke(cli, [command, "owner/repo", *flags], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    rows = read_csv_output(tmp_path / f"owner_repo_{command}.csv")
+    assert [r[case["id"]] for r in rows] == _window_ids(command, kept)
+    lower = flags[flags.index("--since") + 1] if "--since" in flags else "the beginning"
+    upper = flags[flags.index("--until") + 1] if "--until" in flags else "today"
+    assert f"\nWindow: filtered on {case['field']} from {lower} to {upper} (inclusive, UTC)" in capturing.messages
+
+
+@pytest.mark.parametrize("command", list(WINDOW_CASES))
+def test_no_window_flags_leave_requests_and_output_unchanged(command, runner, httpx_mock, tmp_path, monkeypatch):
+    case = WINDOW_CASES[command]
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.chdir(tmp_path)
+    httpx_mock.add_response(url=case["url"]("owner/repo", ""), json=case["body"]())
+
+    result = runner.invoke(cli, [command, "owner/repo"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert len(read_csv_output(tmp_path / f"owner_repo_{command}.csv")) == 5
+    assert [str(r.url) for r in httpx_mock.get_requests()] == [case["url"]("owner/repo", "")]
+    assert not [m for m in capturing.messages if "Window:" in m]
+
+
+@pytest.mark.parametrize("command", list(WINDOW_CASES))
+@pytest.mark.parametrize(
+    "args, message",
+    [
+        (["--since", "not-a-date"], "not-a-date"),
+        (["--until", "2024-13-45"], "2024-13-45"),
+        (["--since", "2024-02-01", "--until", "2024-01-01"], "--since (2024-02-01) must not be after --until"),
+    ],
+)
+def test_invalid_window_exits_nonzero_before_any_request(command, args, message, runner, httpx_mock, tmp_path):
+    result = runner.invoke(cli, [command, "owner/repo", *args])
+
+    assert result.exit_code != 0
+    assert message in result.output
+    assert httpx_mock.get_requests() == []
+
+
+def test_releases_window_keeps_gap_to_previous_out_of_window_release(runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    body = [
+        _release_payload("v2", published_at="2024-01-11T00:00:00Z"),
+        _release_payload("v1", published_at="2024-01-01T00:00:00Z"),
+    ]
+    httpx_mock.add_response(url=WINDOW_CASES["releases"]["url"]("owner/repo", ""), json=body)
+
+    result = runner.invoke(cli, ["releases", "owner/repo", "--since", "2024-01-05"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    rows = read_csv_output(tmp_path / "owner_repo_releases.csv")
+    assert [(r["tag_name"], r["days_since_previous"]) for r in rows] == [("v2", "10.0")]
+
+
+def test_window_keeps_incomplete_fetch_warning(runner, httpx_mock, tmp_path, monkeypatch):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    monkeypatch.chdir(tmp_path)
+    page1 = WINDOW_CASES["workflows"]["url"]("owner/repo", "&created=2024-01-01..2024-01-31")
+    httpx_mock.add_response(
+        url=page1,
+        json=WINDOW_CASES["workflows"]["body"](),
+        headers={"Link": f'<{page1.replace("&page=1", "&page=2")}>; rel="next"'},
+    )
+    httpx_mock.add_exception(httpx.ConnectError("dropped"), url=page1.replace("&page=1", "&page=2"))
+
+    result = runner.invoke(
+        cli, ["workflows", "owner/repo", "--since", "2024-01-01", "--until", "2024-01-31"], catch_exceptions=False
+    )
+
+    assert result.exit_code == 0
+    assert len(read_csv_output(tmp_path / "owner_repo_workflows.csv")) == 3
+    warning = [m for m in capturing.messages if "the saved file UNDERCOUNTS" in m]
+    assert len(warning) == 1
