@@ -173,6 +173,18 @@ time. The summary reports open, merged, and closed-without-merging counts plus t
 to merge among merged PRs, or says so when none exist. The command is read-only and uses only the
 paginated pull request list endpoint, with no per-PR or per-author requests.
 
+### Restricting to a Time Window
+
+`issues`, `pulls`, `commits`, `releases` and `workflows` accept `--since YYYY-MM-DD` and
+`--until YYYY-MM-DD` (UTC, both inclusive). Only records on or after `--since` and on or before
+`--until` are exported and summarized. The window applies to `created_at` for issues, pulls and
+workflows, `authored_at` for commits, and `published_at` for releases. `--since` after `--until` is
+a usage error.
+
+```sh
+stargazers pulls wdm0006/elote --since 2026-01-01 --until 2026-06-30
+```
+
 ### Building an Account Portfolio Overview
 
 ```sh
