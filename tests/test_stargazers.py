@@ -3609,4 +3609,3 @@ def test_contributors_no_profiles_makes_no_user_requests(runner, httpx_mock, tmp
         ["login", *PROFILE_COLUMNS, "contributions", "repo"],
         [{"login": "b", "contributions": "12", "repo": repo}, {"login": "a", "contributions": "3", "repo": repo}],
     )
-    assert "b: 12 commits" in result.output or True
