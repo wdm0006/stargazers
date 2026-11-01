@@ -200,6 +200,25 @@ a usage error.
 stargazers pulls wdm0006/elote --since 2026-01-01 --until 2026-06-30
 ```
 
+### Collection Metadata Sidecar
+
+Every CSV is accompanied by `<csv-name>.meta.json` (for example `owner_repo_issues.csv.meta.json`),
+so a shared file keeps its provenance. No CSV content changes. Pass `--no-metadata` to any
+CSV-writing command to skip the sidecar. No sidecar is written when no CSV is.
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | Sidecar format version (currently `1`) |
+| `command` | The command that wrote the CSV (`repos`, `traffic`, ...) |
+| `stargazers_version` | Installed package version |
+| `collected_at` | UTC ISO-8601 time of the run, to the second |
+| `repositories` | Repositories selected, after include/exclude filtering |
+| `window` | `{"since": ..., "until": ...}` (either may be null), or null without `--since`/`--until` |
+| `options` | Data-affecting options, e.g. `{"no_profiles": true}` |
+| `row_count` | Data rows in the CSV |
+| `complete` | `false` when any selected repository could not be fully collected |
+| `incomplete_repositories` | Repositories whose data is partial or missing (failed pagination, inaccessible traffic, unowned `overview` includes) |
+
 ### Building an Account Portfolio Overview
 
 ```sh

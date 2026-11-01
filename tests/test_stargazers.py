@@ -1,8 +1,10 @@
 import csv
+import json
 import os
 import sys
 import time
 from datetime import datetime, timezone
+from importlib.metadata import version as package_version
 
 import httpx
 import pandas as pd
@@ -3880,3 +3882,316 @@ def test_throughput_incomplete_fetch_warns(runner, httpx_mock, tmp_path, monkeyp
     assert result.exit_code == 0
     assert _throughput_rows_for(tmp_path, "o_a_throughput.csv") == [("2024-01", "o/a", "0", "0", "1", "0", "0")]
     assert len([m for m in capturing.messages if "the saved file UNDERCOUNTS" in m]) == 1
+
+# --- .meta.json provenance sidecar -------------------------------------------------------------
+
+FROZEN_NOW = datetime(2026, 11, 1, 12, 30, 45, 987654, tzinfo=timezone.utc)
+
+
+def _freeze_now(monkeypatch):
+    monkeypatch.setattr("stargazers.cli._utcnow", lambda: FROZEN_NOW)
+
+
+def read_sidecar(csv_path):
+    with open(f"{csv_path}.meta.json", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _expected_sidecar(command, repositories, row_count, **overrides):
+    expected = {
+        "schema_version": 1,
+        "command": command,
+        "stargazers_version": package_version("stargazers"),
+        "collected_at": "2026-11-01T12:30:45+00:00",
+        "repositories": repositories,
+        "window": None,
+        "options": {},
+        "row_count": row_count,
+        "complete": True,
+        "incomplete_repositories": [],
+    }
+    expected.update(overrides)
+    return expected
+
+
+@pytest.mark.parametrize(("command", "endpoint", "payload"), PARTIAL_COMMAND_CASES)
+def test_sidecar_names_incomplete_repository_on_mid_pagination_failure(
+    command, endpoint, payload, runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    _freeze_now(monkeypatch)
+    _mock_command_page(httpx_mock_non_strict_assertion, "testowner/complete", endpoint, payload, incomplete=False)
+    _mock_command_page(httpx_mock_non_strict_assertion, "testowner/partial", endpoint, payload, incomplete=True)
+
+    result = runner.invoke(cli, [command, "testowner/complete", "testowner/partial"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    suffix = "stargazers" if command == "repos" else command
+    csv_path = tmp_path / f"all_repos_{suffix}.csv"
+    options = {"no_profiles": False} if command in {"repos", "forkers", "contributors"} else {}
+    assert read_sidecar(csv_path) == _expected_sidecar(
+        command,
+        ["testowner/complete", "testowner/partial"],
+        2,
+        options=options,
+        complete=False,
+        incomplete_repositories=["testowner/partial"],
+    )
+
+
+@pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
+def test_sidecar_complete_single_repo_records_no_profiles_option(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    _freeze_now(monkeypatch)
+    payload = [{"user": {"login": "u1"}, "starred_at": "2024-01-01T00:00:00Z"}]
+    _mock_command_page(httpx_mock_non_strict_assertion, "testowner/one", "stargazers", payload, incomplete=False)
+
+    result = runner.invoke(cli, ["repos", "testowner/one", "--no-profiles"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert read_sidecar(tmp_path / "testowner_one_stargazers.csv") == _expected_sidecar(
+        "repos", ["testowner/one"], 1, options={"no_profiles": True}
+    )
+
+
+@pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
+def test_sidecar_lists_only_valid_repositories(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _freeze_now(monkeypatch)
+    payload = [{"login": "u1", "contributions": 3}]
+    _mock_command_page(httpx_mock_non_strict_assertion, "testowner/one", "contributors", payload, incomplete=False)
+
+    result = runner.invoke(cli, ["contributors", "bogus", "testowner/one", "--no-profiles"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert read_sidecar(tmp_path / "all_repos_contributors.csv")["repositories"] == ["testowner/one"]
+
+
+def _server_filter(command):
+    return {
+        "issues": "&since=2024-01-01T00:00:00Z",
+        "commits": "&since=2024-01-01T00:00:00Z",
+        "workflows": "&created=2024-01-01..2024-01-31",
+    }.get(command, "")
+
+
+@pytest.mark.parametrize("command", ["issues", "pulls", "releases", "commits", "workflows"])
+def test_sidecar_records_window_and_incomplete_fetch(command, runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    _freeze_now(monkeypatch)
+    case = WINDOW_CASES[command]
+    page1 = case["url"]("owner/repo", _server_filter(command))
+    page2 = page1.replace("&page=1", "&page=2")
+    httpx_mock.add_response(url=page1, json=case["body"](), headers={"Link": f'<{page2}>; rel="next"'})
+    httpx_mock.add_exception(httpx.ConnectError("dropped"), url=page2)
+
+    result = runner.invoke(
+        cli, [command, "owner/repo", "--since", "2024-01-01", "--until", "2024-01-31"], catch_exceptions=False
+    )
+
+    assert result.exit_code == 0
+    csv_path = tmp_path / f"owner_repo_{command}.csv"
+    rows = read_csv_output(csv_path)
+    assert len(rows) > 0
+    assert read_sidecar(csv_path) == _expected_sidecar(
+        command,
+        ["owner/repo"],
+        len(rows),
+        window={"since": "2024-01-01", "until": "2024-01-31"},
+        complete=False,
+        incomplete_repositories=["owner/repo"],
+    )
+
+
+@pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
+@pytest.mark.parametrize(("command", "endpoint", "payload"), PARTIAL_COMMAND_CASES)
+def test_no_metadata_writes_no_sidecar_and_csv_bytes_match(
+    command, endpoint, payload, runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    repo = "testowner/repo"
+    suffix = "stargazers" if command == "repos" else command
+    csv_path = tmp_path / f"testowner_repo_{suffix}.csv"
+    sidecar_path = tmp_path / f"{csv_path.name}.meta.json"
+    flags = ["--no-profiles"] if command in {"repos", "forkers", "contributors"} else []
+
+    _mock_command_page(httpx_mock_non_strict_assertion, repo, endpoint, payload, incomplete=False)
+    assert runner.invoke(cli, [command, repo, *flags], catch_exceptions=False).exit_code == 0
+    with_sidecar = csv_path.read_bytes()
+    assert sidecar_path.exists()
+    csv_path.unlink()
+    sidecar_path.unlink()
+
+    _mock_command_page(httpx_mock_non_strict_assertion, repo, endpoint, payload, incomplete=False)
+    result = runner.invoke(cli, [command, repo, *flags, "--no-metadata"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert csv_path.read_bytes() == with_sidecar
+    assert [p.name for p in tmp_path.iterdir()] == [csv_path.name]
+
+
+def test_empty_dataset_writes_no_csv_and_no_sidecar(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _mock_command_page(httpx_mock_non_strict_assertion, "testowner/empty", "releases", [], incomplete=False)
+
+    result = runner.invoke(cli, ["releases", "testowner/empty"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_account_trend_sidecar_names_incomplete_repository(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    httpx_mock = httpx_mock_non_strict_assertion
+    monkeypatch.chdir(tmp_path)
+    _freeze_now(monkeypatch)
+    mock_user_repos_api(
+        httpx_mock,
+        "testuser",
+        [
+            {"full_name": "testuser/repo1", "owner": {"login": "testuser"}},
+            {"full_name": "testuser/repo2", "owner": {"login": "testuser"}},
+            {"full_name": "testuser/other", "owner": {"login": "testuser"}},
+        ],
+    )
+    mock_stargazers_api(httpx_mock, "testuser/repo1", [{"login": "sg1", "starred_at": "2023-01-01T10:00:00Z"}])
+    star_url = f"{BASE_API_URL}/repos/testuser/repo2/stargazers"
+    httpx_mock.add_response(
+        url=f"{star_url}?per_page={PER_PAGE}&page=1",
+        json=[{"user": {"login": "sg2", "id": 2}, "starred_at": "2023-01-02T10:00:00Z"}],
+        headers={"Link": f'<{star_url}?per_page={PER_PAGE}&page=2>; rel="next"'},
+    )
+    httpx_mock.add_exception(httpx.ConnectError("boom"), url=f"{star_url}?per_page={PER_PAGE}&page=2")
+
+    result = runner.invoke(
+        cli, ["account-trend", "testuser", "--exclude-repo", "testuser/other"], catch_exceptions=False
+    )
+
+    assert result.exit_code == 0
+    csv_path = tmp_path / "testuser_account_stars_by_day.csv"
+    assert read_sidecar(csv_path) == _expected_sidecar(
+        "account-trend",
+        ["testuser/repo1", "testuser/repo2"],
+        len(read_csv_output(csv_path)),
+        complete=False,
+        incomplete_repositories=["testuser/repo2"],
+    )
+    assert len(read_csv_output(csv_path)) == 2
+
+
+def test_overview_sidecar_reports_selection_after_filters_and_unowned_includes(
+    runner, httpx_mock, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    _freeze_now(monkeypatch)
+    mock_user_repos_pages(
+        httpx_mock,
+        "testuser",
+        [[_repo_snapshot("testuser/alpha"), _repo_snapshot("testuser/beta"), _repo_snapshot("testuser/gamma")]],
+    )
+
+    result = runner.invoke(
+        cli,
+        ["overview", "testuser", "--exclude-repo", "testuser/beta", "--include-repo", "elsewhere/ghost"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert read_sidecar(tmp_path / "testuser_repos_overview.csv") == _expected_sidecar(
+        "overview",
+        ["elsewhere/ghost", "testuser/alpha", "testuser/gamma"],
+        2,
+        complete=False,
+        incomplete_repositories=["elsewhere/ghost"],
+    )
+
+
+def test_overview_no_metadata_writes_no_sidecar(runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    mock_user_repos_pages(httpx_mock, "testuser", [[_repo_snapshot("testuser/alpha")]])
+
+    result = runner.invoke(cli, ["overview", "testuser", "--no-metadata"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert [p.name for p in tmp_path.iterdir()] == ["testuser_repos_overview.csv"]
+
+
+def _traffic_fixture(httpx_mock, clones_forbidden_for=None, views_forbidden_for=None):
+    mock_user_repos_api(
+        httpx_mock,
+        "testuser",
+        [
+            {"full_name": "testuser/repo1", "owner": {"login": "testuser"}},
+            {"full_name": "testuser/repo2", "owner": {"login": "testuser"}},
+            {"full_name": "testuser/repo3", "owner": {"login": "testuser"}},
+        ],
+    )
+    day = [{"timestamp": "2026-07-18T00:00:00Z", "count": 5, "uniques": 3}]
+    for repo in ("testuser/repo1", "testuser/repo2", "testuser/repo3"):
+        if repo == views_forbidden_for:
+            httpx_mock.add_response(
+                url=f"{BASE_API_URL}/repos/{repo}/traffic/views", json={"message": "Forbidden"}, status_code=403
+            )
+            continue
+        mock_traffic_views_api(httpx_mock, repo, {"count": 5, "uniques": 3, "views": day})
+        if repo == clones_forbidden_for:
+            httpx_mock.add_response(
+                url=f"{BASE_API_URL}/repos/{repo}/traffic/clones", json={"message": "Forbidden"}, status_code=403
+            )
+        else:
+            mock_traffic_clones_api(httpx_mock, repo, {"count": 2, "uniques": 1, "clones": day})
+        mock_traffic_referrers_api(httpx_mock, repo, [{"referrer": "google.com", "count": 4, "uniques": 2}])
+
+
+def test_traffic_sidecars_for_each_csv_name_unavailable_repositories(
+    runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _seconds: None)
+    _freeze_now(monkeypatch)
+    _traffic_fixture(
+        httpx_mock_non_strict_assertion,
+        clones_forbidden_for="testuser/repo2",
+        views_forbidden_for="testuser/repo3",
+    )
+
+    result = runner.invoke(cli, ["traffic", "testuser"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    selected = ["testuser/repo1", "testuser/repo2", "testuser/repo3"]
+    incomplete = ["testuser/repo2", "testuser/repo3"]
+    assert read_sidecar(tmp_path / "testuser_traffic.csv") == _expected_sidecar(
+        "traffic", selected, 2, complete=False, incomplete_repositories=incomplete
+    )
+    assert read_sidecar(tmp_path / "testuser_traffic_by_day.csv") == _expected_sidecar(
+        "traffic", selected, 2, complete=False, incomplete_repositories=incomplete
+    )
+    assert read_sidecar(tmp_path / "testuser_referrers.csv") == _expected_sidecar(
+        "traffic", selected, 1, complete=False, incomplete_repositories=["testuser/repo3"]
+    )
+
+
+def test_traffic_complete_sidecar_and_no_metadata(runner, httpx_mock_non_strict_assertion, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _freeze_now(monkeypatch)
+    _traffic_fixture(httpx_mock_non_strict_assertion)
+
+    assert runner.invoke(cli, ["traffic", "testuser"], catch_exceptions=False).exit_code == 0
+    assert read_sidecar(tmp_path / "testuser_traffic.csv") == _expected_sidecar(
+        "traffic", ["testuser/repo1", "testuser/repo2", "testuser/repo3"], 3
+    )
+    for path in tmp_path.glob("*.meta.json"):
+        path.unlink()
+
+    _traffic_fixture(httpx_mock_non_strict_assertion)
+    assert runner.invoke(cli, ["traffic", "testuser", "--no-metadata"], catch_exceptions=False).exit_code == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "testuser_referrers.csv",
+        "testuser_traffic.csv",
+        "testuser_traffic_by_day.csv",
+    ]
