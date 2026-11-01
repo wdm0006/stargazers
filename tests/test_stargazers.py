@@ -3883,6 +3883,7 @@ def test_throughput_incomplete_fetch_warns(runner, httpx_mock, tmp_path, monkeyp
     assert _throughput_rows_for(tmp_path, "o_a_throughput.csv") == [("2024-01", "o/a", "0", "0", "1", "0", "0")]
     assert len([m for m in capturing.messages if "the saved file UNDERCOUNTS" in m]) == 1
 
+
 # --- .meta.json provenance sidecar -------------------------------------------------------------
 
 FROZEN_NOW = datetime(2026, 11, 1, 12, 30, 45, 987654, tzinfo=timezone.utc)
