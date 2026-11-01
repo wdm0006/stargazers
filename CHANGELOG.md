@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Add a `throughput` command that exports monthly opened/closed issue and opened/merged/closed-unmerged PR counts per repository, each counted by its own event timestamp.
+
 ## 0.4.0 - 2026-10-10
 
 ### Added
