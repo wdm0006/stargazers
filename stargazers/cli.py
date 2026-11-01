@@ -1,7 +1,9 @@
+import json
 import os
 import time
 from collections import Counter
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 
 import click
 import httpx
@@ -1023,7 +1025,63 @@ def fetch_user_metadata(users_info: list, timestamp_key: str | None = "starred_a
     return data
 
 
-def summarize_and_save(data: list, base_name: str, output_file_suffix: str, timestamp_key: str | None) -> None:
+no_metadata_option = click.option(
+    "--no-metadata",
+    is_flag=True,
+    help="Do not write the <file>.csv.meta.json provenance sidecar next to each CSV.",
+)
+
+METADATA_SCHEMA_VERSION = 1
+
+
+def _collection_meta(
+    no_metadata: bool,
+    command: str,
+    repositories: list[str],
+    incomplete: list[str] | None = None,
+    window: tuple[str | None, str | None] | None = None,
+    options: dict | None = None,
+) -> dict | None:
+    """Provenance for a command's CSVs, or None when the user passed --no-metadata."""
+    if no_metadata:
+        return None
+    return {
+        "command": command,
+        "repositories": list(repositories),
+        "incomplete_repositories": sorted(set(incomplete or [])),
+        "window": None if window is None else {"since": window[0], "until": window[1]},
+        "options": options or {},
+    }
+
+
+def _write_metadata(csv_path: str, meta: dict | None, row_count: int) -> None:
+    """Write ``<csv_path>.meta.json`` describing how the CSV was collected."""
+    if meta is None:
+        return
+    try:
+        package_version = version("stargazers")
+    except PackageNotFoundError:
+        package_version = "unknown"
+    sidecar = {
+        "schema_version": METADATA_SCHEMA_VERSION,
+        "command": meta["command"],
+        "stargazers_version": package_version,
+        "collected_at": _utcnow().replace(microsecond=0).isoformat(),
+        "repositories": meta["repositories"],
+        "window": meta["window"],
+        "options": meta["options"],
+        "row_count": row_count,
+        "complete": not meta["incomplete_repositories"],
+        "incomplete_repositories": meta["incomplete_repositories"],
+    }
+    with open(f"{csv_path}.meta.json", "w") as handle:
+        json.dump(sidecar, handle, indent=2)
+        handle.write("\n")
+
+
+def summarize_and_save(
+    data: list, base_name: str, output_file_suffix: str, timestamp_key: str | None, meta: dict | None = None
+) -> None:
     if not data:
         console.log("[yellow]No data to summarize or save.[/]")
         return
@@ -1036,6 +1094,7 @@ def summarize_and_save(data: list, base_name: str, output_file_suffix: str, time
     output_file = f"{base_name.replace('/', '_')}_{output_file_suffix}.csv"
     console.log(f"Saving DataFrame with {len(df)} rows to {output_file}")
     df.to_csv(output_file, index=False)
+    _write_metadata(output_file, meta, len(df))
     console.print(f"[green]\nSaved {len(df)} items to {output_file}[/]")
 
     if not df.empty and "location" in df.columns:  # Stargazer/forker specific summary
@@ -1112,8 +1171,9 @@ def cli():
 @cli.command("repos")
 @click.argument("repositories", nargs=-1, required=True)
 @no_profiles_option
+@no_metadata_option
 @click.pass_context
-def stargazers_repos_command(ctx, repositories: tuple[str], no_profiles: bool):
+def stargazers_repos_command(ctx, repositories: tuple[str], no_profiles: bool, no_metadata: bool):
     """Fetches and analyzes STARGÀZERS for one or more repositories."""
     console.log(f"Command: 'repos', Args: {repositories}")
     all_metadata = []
@@ -1146,15 +1206,28 @@ def stargazers_repos_command(ctx, repositories: tuple[str], no_profiles: bool):
     else:
         base_output_name = "all_repos"  # For multiple repos or if a single one was invalid
 
-    summarize_and_save(all_metadata, base_output_name, "stargazers", timestamp_key="starred_at")
+    summarize_and_save(
+        all_metadata,
+        base_output_name,
+        "stargazers",
+        timestamp_key="starred_at",
+        meta=_collection_meta(
+            no_metadata,
+            "repos",
+            [repo for repo in repositories if "/" in repo],
+            incomplete_repos,
+            options={"no_profiles": no_profiles},
+        ),
+    )
     _warn_incomplete(incomplete_repos, "stargazer")
 
 
 @cli.command("forkers")
 @click.argument("repositories", nargs=-1, required=True)
 @no_profiles_option
+@no_metadata_option
 @click.pass_context
-def forkers_command(ctx, repositories: tuple[str], no_profiles: bool):
+def forkers_command(ctx, repositories: tuple[str], no_profiles: bool, no_metadata: bool):
     """Fetches and analyzes FORKERS for one or more repositories."""
     console.log(f"Command: 'forkers', Args: {repositories}")
     all_metadata = []
@@ -1185,15 +1258,28 @@ def forkers_command(ctx, repositories: tuple[str], no_profiles: bool):
     else:
         base_output_name = "all_repos"
 
-    summarize_and_save(all_metadata, base_output_name, "forkers", timestamp_key="forked_at")
+    summarize_and_save(
+        all_metadata,
+        base_output_name,
+        "forkers",
+        timestamp_key="forked_at",
+        meta=_collection_meta(
+            no_metadata,
+            "forkers",
+            [repo for repo in repositories if "/" in repo],
+            incomplete_repos,
+            options={"no_profiles": no_profiles},
+        ),
+    )
     _warn_incomplete(incomplete_repos, "forker")
 
 
 @cli.command("contributors")
 @click.argument("repositories", nargs=-1, required=True)
 @no_profiles_option
+@no_metadata_option
 @click.pass_context
-def contributors_command(ctx, repositories: tuple[str], no_profiles: bool):
+def contributors_command(ctx, repositories: tuple[str], no_profiles: bool, no_metadata: bool):
     """Fetches and analyzes CONTRIBUTORS for one or more repositories."""
     console.log(f"Command: 'contributors', Args: {repositories}")
     all_metadata = []
@@ -1218,7 +1304,19 @@ def contributors_command(ctx, repositories: tuple[str], no_profiles: bool):
 
     all_metadata.sort(key=lambda contributor: contributor["contributions"], reverse=True)
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
-    summarize_and_save(all_metadata, base_output_name, "contributors", timestamp_key=None)
+    summarize_and_save(
+        all_metadata,
+        base_output_name,
+        "contributors",
+        timestamp_key=None,
+        meta=_collection_meta(
+            no_metadata,
+            "contributors",
+            [repo for repo in repositories if "/" in repo],
+            incomplete_repos,
+            options={"no_profiles": no_profiles},
+        ),
+    )
     _warn_incomplete(incomplete_repos, "contributor")
 
     console.print("\nContributor Summary:")
@@ -1260,8 +1358,9 @@ def _summarize_issue_engagement(items: list) -> None:
 @cli.command("issues")
 @click.argument("repositories", nargs=-1, required=True)
 @_window_options
+@no_metadata_option
 @click.pass_context
-def issues_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None):
+def issues_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None, no_metadata: bool):
     """Fetches and analyzes ISSUE and PULL REQUEST engagement for one or more repositories."""
     console.log(f"Command: 'issues', Args: {repositories}")
     window = _parse_window(since, until)
@@ -1289,7 +1388,15 @@ def issues_command(ctx, repositories: tuple[str], since: datetime | None, until:
     # re-typing the column — both timestamps stay exactly as GitHub returned them.
     all_items.sort(key=lambda item: item["created_at"] or "", reverse=True)
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
-    summarize_and_save(all_items, base_output_name, "issues", timestamp_key=None)
+    summarize_and_save(
+        all_items,
+        base_output_name,
+        "issues",
+        timestamp_key=None,
+        meta=_collection_meta(
+            no_metadata, "issues", [repo for repo in repositories if "/" in repo], incomplete_repos, window
+        ),
+    )
     _warn_incomplete(incomplete_repos, "issue and pull request")
     _print_window("created_at", window)
     _summarize_issue_engagement(all_items)
@@ -1333,8 +1440,9 @@ def _summarize_release_cadence(items: list) -> None:
 @cli.command("releases")
 @click.argument("repositories", nargs=-1, required=True)
 @_window_options
+@no_metadata_option
 @click.pass_context
-def releases_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None):
+def releases_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None, no_metadata: bool):
     """Fetches and analyzes RELEASE cadence and asset downloads for one or more repositories."""
     console.log(f"Command: 'releases', Args: {repositories}")
     window = _parse_window(since, until)
@@ -1363,7 +1471,15 @@ def releases_command(ctx, repositories: tuple[str], since: datetime | None, unti
     # re-typing the column — both timestamps stay exactly as GitHub returned them.
     all_items.sort(key=lambda item: item["published_at"] or "", reverse=True)
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
-    summarize_and_save(all_items, base_output_name, "releases", timestamp_key=None)
+    summarize_and_save(
+        all_items,
+        base_output_name,
+        "releases",
+        timestamp_key=None,
+        meta=_collection_meta(
+            no_metadata, "releases", [repo for repo in repositories if "/" in repo], incomplete_repos, window
+        ),
+    )
     _warn_incomplete(incomplete_repos, "release")
     _print_window("published_at", window)
     _summarize_release_cadence(all_items)
@@ -1394,8 +1510,9 @@ def _summarize_commit_cadence(items: list) -> None:
 @cli.command("commits")
 @click.argument("repositories", nargs=-1, required=True)
 @_window_options
+@no_metadata_option
 @click.pass_context
-def commits_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None):
+def commits_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None, no_metadata: bool):
     """Fetches and analyzes COMMIT cadence and authors for one or more repositories."""
     console.log(f"Command: 'commits', Args: {repositories}")
     window = _parse_window(since, until)
@@ -1420,7 +1537,15 @@ def commits_command(ctx, repositories: tuple[str], since: datetime | None, until
 
     all_items.sort(key=lambda item: item["authored_at"] or "", reverse=True)
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
-    summarize_and_save(all_items, base_output_name, "commits", timestamp_key=None)
+    summarize_and_save(
+        all_items,
+        base_output_name,
+        "commits",
+        timestamp_key=None,
+        meta=_collection_meta(
+            no_metadata, "commits", [repo for repo in repositories if "/" in repo], incomplete_repos, window
+        ),
+    )
     _warn_incomplete(incomplete_repos, "commit")
     _print_window("authored_at", window)
     _summarize_commit_cadence(all_items)
@@ -1451,8 +1576,9 @@ def _summarize_workflow_runs(items: list) -> None:
 @cli.command("workflows")
 @click.argument("repositories", nargs=-1, required=True)
 @_window_options
+@no_metadata_option
 @click.pass_context
-def workflows_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None):
+def workflows_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None, no_metadata: bool):
     """Fetches and analyzes CI workflow run reliability and duration for one or more repositories."""
     console.log(f"Command: 'workflows', Args: {repositories}")
     window = _parse_window(since, until)
@@ -1477,7 +1603,15 @@ def workflows_command(ctx, repositories: tuple[str], since: datetime | None, unt
 
     all_items.sort(key=lambda item: item["created_at"] or "", reverse=True)
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
-    summarize_and_save(all_items, base_output_name, "workflows", timestamp_key=None)
+    summarize_and_save(
+        all_items,
+        base_output_name,
+        "workflows",
+        timestamp_key=None,
+        meta=_collection_meta(
+            no_metadata, "workflows", [repo for repo in repositories if "/" in repo], incomplete_repos, window
+        ),
+    )
     _warn_incomplete(incomplete_repos, "workflow run")
     _print_window("created_at", window)
     _summarize_workflow_runs(all_items)
@@ -1506,8 +1640,9 @@ def _summarize_pulls(items: list) -> None:
 @cli.command("pulls")
 @click.argument("repositories", nargs=-1, required=True)
 @_window_options
+@no_metadata_option
 @click.pass_context
-def pulls_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None):
+def pulls_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None, no_metadata: bool):
     """Fetches pull request merge outcomes and creation-to-merge time for one or more repositories."""
     console.log(f"Command: 'pulls', Args: {repositories}")
     window = _parse_window(since, until)
@@ -1532,7 +1667,15 @@ def pulls_command(ctx, repositories: tuple[str], since: datetime | None, until: 
 
     all_items.sort(key=lambda item: item["created_at"] or "", reverse=True)
     base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
-    summarize_and_save(all_items, base_output_name, "pulls", timestamp_key=None)
+    summarize_and_save(
+        all_items,
+        base_output_name,
+        "pulls",
+        timestamp_key=None,
+        meta=_collection_meta(
+            no_metadata, "pulls", [repo for repo in repositories if "/" in repo], incomplete_repos, window
+        ),
+    )
     _warn_incomplete(incomplete_repos, "pull request")
     _print_window("created_at", window)
     _summarize_pulls(all_items)
@@ -1575,8 +1718,9 @@ def _summarize_repo_portfolio(items: list) -> None:
     multiple=True,
     help="Additional repositories to include (format: owner/repo). Can be used multiple times.",
 )
+@no_metadata_option
 @click.pass_context
-def overview_command(ctx, username: str, exclude_repos: tuple[str], include_repos: tuple[str]):
+def overview_command(ctx, username: str, exclude_repos: tuple[str], include_repos: tuple[str], no_metadata: bool):
     """
     Builds a portfolio snapshot of the repositories owned by USERNAME.
 
@@ -1624,7 +1768,13 @@ def overview_command(ctx, username: str, exclude_repos: tuple[str], include_repo
         return
 
     all_items.sort(key=lambda item: item["stars"], reverse=True)
-    summarize_and_save(all_items, username, "repos_overview", timestamp_key=None)
+    summarize_and_save(
+        all_items,
+        username,
+        "repos_overview",
+        timestamp_key=None,
+        meta=_collection_meta(no_metadata, "overview", repos_to_process, unavailable),
+    )
     _summarize_repo_portfolio(all_items)
 
 
@@ -1643,8 +1793,11 @@ def overview_command(ctx, username: str, exclude_repos: tuple[str], include_repo
     help="Additional repositories to include (format: owner/repo). Can be used multiple times.",
 )
 @click.option("--line-chart", is_flag=True, help="Display a line chart of cumulative stars over time in the terminal.")
+@no_metadata_option
 @click.pass_context
-def account_trend_command(ctx, username: str, exclude_repos: tuple[str], include_repos: tuple[str], line_chart: bool):
+def account_trend_command(
+    ctx, username: str, exclude_repos: tuple[str], include_repos: tuple[str], line_chart: bool, no_metadata: bool
+):
     """
     Analyzes star trends over time for a user's owned repositories and any additionally included ones.
     Fetches star events across all specified repositories (owned by USERNAME + included, minus excluded),
@@ -1777,7 +1930,13 @@ def account_trend_command(ctx, username: str, exclude_repos: tuple[str], include
         )
 
     output_base_name = username
-    summarize_and_save(final_df.to_dict("records"), output_base_name, "account_stars_by_day", timestamp_key="star_date")
+    summarize_and_save(
+        final_df.to_dict("records"),
+        output_base_name,
+        "account_stars_by_day",
+        timestamp_key="star_date",
+        meta=_collection_meta(no_metadata, "account-trend", repos_to_process, incomplete_repos),
+    )
 
 
 @cli.command("traffic")
@@ -1794,8 +1953,9 @@ def account_trend_command(ctx, username: str, exclude_repos: tuple[str], include
     multiple=True,
     help="Additional repositories to include (format: owner/repo). Can be used multiple times.",
 )
+@no_metadata_option
 @click.pass_context
-def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos: tuple[str]):
+def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos: tuple[str], no_metadata: bool):
     """
     Aggregates GitHub traffic data (views, clones, referrers) across all repositories
     owned by USERNAME. Shows totals, top repos by views, and aggregated referrer data.
@@ -1833,6 +1993,7 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
     traffic_by_day = []
     all_referrers = {}  # referrer -> {count, uniques}
     skipped = 0
+    skipped_repos = []
     clones_unavailable = []
     referrers_unavailable = []
 
@@ -1840,6 +2001,7 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
         views = fetch_traffic_views(repo_name)
         if views is None:
             skipped += 1
+            skipped_repos.append(repo_name)
             continue
 
         clones = fetch_traffic_clones(repo_name)
@@ -1930,6 +2092,10 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
     combined_df = views_df.merge(clones_df, on="repo")
     output_file = f"{username}_traffic.csv"
     combined_df.to_csv(output_file, index=False)
+    traffic_incomplete = skipped_repos + clones_unavailable
+    _write_metadata(
+        output_file, _collection_meta(no_metadata, "traffic", repos_to_process, traffic_incomplete), len(combined_df)
+    )
     console.print(f"\n[green]Saved per-repo traffic data to {output_file}[/]")
 
     if traffic_by_day:
@@ -1938,11 +2104,21 @@ def traffic_command(ctx, username: str, exclude_repos: tuple[str], include_repos
             by_day_df[column] = by_day_df[column].astype("Int64")
         by_day_output = f"{username}_traffic_by_day.csv"
         by_day_df.to_csv(by_day_output, index=False)
+        _write_metadata(
+            by_day_output,
+            _collection_meta(no_metadata, "traffic", repos_to_process, traffic_incomplete),
+            len(by_day_df),
+        )
         console.print(f"[green]Saved per-day traffic data to {by_day_output}[/]")
 
     if all_referrers:
         ref_output = f"{username}_referrers.csv"
         ref_df.to_csv(ref_output, index=False)
+        _write_metadata(
+            ref_output,
+            _collection_meta(no_metadata, "traffic", repos_to_process, skipped_repos + referrers_unavailable),
+            len(ref_df),
+        )
         console.print(f"[green]Saved aggregated referrer data to {ref_output}[/]")
 
 
