@@ -51,6 +51,7 @@ After installation, you can run the CLI from anywhere in your shell using the `s
 *   `commits`: Fetches commit cadence, merge counts, and author activity for one or more repositories.
 *   `workflows`: Fetches CI workflow run reliability and duration for one or more repositories.
 *   `pulls`: Fetches pull request merge outcomes and creation-to-merge time for one or more repositories.
+*   `throughput`: Counts issues and PRs opened, closed and merged per calendar month for one or more repositories.
 *   `overview`: Builds a per-repository portfolio snapshot of an account's owned repositories.
 *   `account-trend`: Analyzes star trends over time for all of a user's owned repositories.
 
@@ -173,9 +174,23 @@ time. The summary reports open, merged, and closed-without-merging counts plus t
 to merge among merged PRs, or says so when none exist. The command is read-only and uses only the
 paginated pull request list endpoint, with no per-PR or per-author requests.
 
+### Monthly Throughput
+
+```sh
+stargazers throughput <owner/repo> [<owner/repo> ...]
+```
+
+Writes `<owner>_<repo>_throughput.csv` (or `all_repos_throughput.csv`) with `month` (UTC, `YYYY-MM`), `repo`,
+`issues_opened`, `issues_closed`, `prs_opened`, `prs_merged`, and `prs_closed_unmerged`. Each column is counted by
+the month of its own event timestamp (`created_at`, `closed_at`, `merged_at`), so a PR opened in January and
+merged in March counts in each month separately. Months with no activity between a repository's first and last
+active month are zero-filled. Pull requests are never counted as issues. The summary prints the net issue backlog
+change and the latest month. It reuses the issues and pull request list endpoints only. `--since`/`--until`
+apply to each event's own timestamp.
+
 ### Restricting to a Time Window
 
-`issues`, `pulls`, `commits`, `releases` and `workflows` accept `--since YYYY-MM-DD` and
+`issues`, `pulls`, `throughput`, `commits`, `releases` and `workflows` accept `--since YYYY-MM-DD` and
 `--until YYYY-MM-DD` (UTC, both inclusive). Only records on or after `--since` and on or before
 `--until` are exported and summarized. The window applies to `created_at` for issues, pulls and
 workflows, `authored_at` for commits, and `published_at` for releases. `--since` after `--until` is

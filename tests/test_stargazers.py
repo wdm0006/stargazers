@@ -3781,6 +3781,109 @@ def test_window_keeps_incomplete_fetch_warning(runner, httpx_mock, tmp_path, mon
     assert len(warning) == 1
 
 
+THROUGHPUT_HEADER = [
+    "month",
+    "repo",
+    "issues_opened",
+    "issues_closed",
+    "prs_opened",
+    "prs_merged",
+    "prs_closed_unmerged",
+]
+
+
+def _throughput_mock(httpx_mock, repo, issues, pulls, *, pulls_incomplete=False):
+    issues_url = f"{BASE_API_URL}/repos/{repo}/issues?{ISSUES_BASE_PARAMS}&page=1"
+    httpx_mock.add_response(url=issues_url, json=issues)
+    if pulls_incomplete:
+        httpx_mock.add_response(
+            url=_pulls_url(repo), json=pulls, headers={"Link": f'<{_pulls_url(repo, 2)}>; rel="next"'}
+        )
+        httpx_mock.add_exception(httpx.ConnectError("dropped"), url=_pulls_url(repo, 2))
+    else:
+        httpx_mock.add_response(url=_pulls_url(repo), json=pulls)
+    return [issues_url, _pulls_url(repo)] + ([_pulls_url(repo, 2)] if pulls_incomplete else [])
+
+
+def _throughput_rows_for(tmp_path, name):
+    return [tuple(r.values()) for r in read_csv_output(tmp_path / name)]
+
+
+def test_throughput_exact_monthly_counts_multi_repo(runner, httpx_mock, tmp_path, monkeypatch):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _s: None)
+    monkeypatch.chdir(tmp_path)
+    urls = _throughput_mock(
+        httpx_mock,
+        "o/a",
+        [
+            _issue_payload(1, created_at="2024-01-10T00:00:00Z", closed_at="2024-03-02T00:00:00Z"),
+            _issue_payload(2, created_at="2024-01-20T00:00:00Z", state="open"),
+            # A PR in the issues feed must never count as an issue.
+            _issue_payload(3, created_at="2024-01-21T00:00:00Z", is_pr=True, closed_at="2024-01-22T00:00:00Z"),
+        ],
+        [
+            _pull_payload(3, "2024-01-21T00:00:00Z", "closed", "2024-03-05T00:00:00Z", "2024-03-05T00:00:00Z"),
+            _pull_payload(4, "2024-03-01T00:00:00Z", "closed", "2024-03-09T00:00:00Z"),
+        ],
+    )
+    urls += _throughput_mock(
+        httpx_mock,
+        "o/b",
+        [_issue_payload(1, created_at="2024-02-03T00:00:00Z", closed_at="2024-02-04T00:00:00Z")],
+        [],
+    )
+
+    result = runner.invoke(cli, ["throughput", "o/a", "o/b"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    path = tmp_path / "all_repos_throughput.csv"
+    with open(path, newline="") as f:
+        assert next(csv.reader(f)) == THROUGHPUT_HEADER
+    assert _throughput_rows_for(tmp_path, "all_repos_throughput.csv") == [
+        ("2024-01", "o/a", "2", "0", "1", "0", "0"),
+        ("2024-02", "o/a", "0", "0", "0", "0", "0"),
+        ("2024-02", "o/b", "1", "1", "0", "0", "0"),
+        ("2024-03", "o/a", "0", "1", "1", "1", "1"),
+    ]
+    assert "Net issue backlog change: +1 (3 opened, 2 closed)" in capturing.messages
+    assert "Latest month (2024-03):" in capturing.messages
+    assert [str(r.url) for r in httpx_mock.get_requests()] == urls or sorted(
+        str(r.url) for r in httpx_mock.get_requests()
+    ) == sorted(urls)
+
+
+def test_throughput_window_counts_each_event_by_own_timestamp(runner, httpx_mock, tmp_path, monkeypatch):
+    monkeypatch.setattr("stargazers.cli.console", CapturingConsole())
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _s: None)
+    monkeypatch.chdir(tmp_path)
+    httpx_mock.add_response(
+        url=f"{BASE_API_URL}/repos/o/a/issues?{ISSUES_BASE_PARAMS}&page=1",
+        json=[_issue_payload(1, created_at="2024-01-10T00:00:00Z", closed_at="2024-02-02T00:00:00Z")],
+    )
+    httpx_mock.add_response(url=_pulls_url("o/a"), json=[])
+
+    result = runner.invoke(cli, ["throughput", "o/a", "--since", "2024-02-01"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert _throughput_rows_for(tmp_path, "o_a_throughput.csv") == [("2024-02", "o/a", "0", "1", "0", "0", "0")]
+
+
+def test_throughput_incomplete_fetch_warns(runner, httpx_mock, tmp_path, monkeypatch):
+    capturing = CapturingConsole()
+    monkeypatch.setattr("stargazers.cli.console", capturing)
+    monkeypatch.setattr("stargazers.cli.time.sleep", lambda _s: None)
+    monkeypatch.chdir(tmp_path)
+    _throughput_mock(httpx_mock, "o/a", [], [_pull_payload(1, "2024-01-01T00:00:00Z")], pulls_incomplete=True)
+
+    result = runner.invoke(cli, ["throughput", "o/a"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert _throughput_rows_for(tmp_path, "o_a_throughput.csv") == [("2024-01", "o/a", "0", "0", "1", "0", "0")]
+    assert len([m for m in capturing.messages if "the saved file UNDERCOUNTS" in m]) == 1
+
+
 # --- .meta.json provenance sidecar -------------------------------------------------------------
 
 FROZEN_NOW = datetime(2026, 11, 1, 12, 30, 45, 987654, tzinfo=timezone.utc)

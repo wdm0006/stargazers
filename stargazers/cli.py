@@ -1681,6 +1681,90 @@ def pulls_command(ctx, repositories: tuple[str], since: datetime | None, until: 
     _summarize_pulls(all_items)
 
 
+THROUGHPUT_COLUMNS = ["issues_opened", "issues_closed", "prs_opened", "prs_merged", "prs_closed_unmerged"]
+
+
+def _throughput_rows(repo: str, issues: list, pulls: list, window) -> list[dict]:
+    """Monthly (UTC) event counts for one repository, zero-filled between its first and last active month."""
+    counts: dict[str, dict[str, int]] = {}
+
+    def bump(timestamp: str | None, column: str) -> None:
+        if timestamp and _in_window(timestamp, window):
+            month = counts.setdefault(timestamp[:7], dict.fromkeys(THROUGHPUT_COLUMNS, 0))
+            month[column] += 1
+
+    for item in issues:
+        if item["type"] != "issue":
+            continue
+        bump(item["created_at"], "issues_opened")
+        bump(item["closed_at"], "issues_closed")
+    for item in pulls:
+        bump(item["created_at"], "prs_opened")
+        if item["merged_at"]:
+            bump(item["merged_at"], "prs_merged")
+        else:
+            bump(item["closed_at"], "prs_closed_unmerged")
+
+    if not counts:
+        return []
+    first_year, first_month = map(int, min(counts).split("-"))
+    last_year, last_month = map(int, max(counts).split("-"))
+    rows = []
+    year, month = first_year, first_month
+    while (year, month) <= (last_year, last_month):
+        key = f"{year:04d}-{month:02d}"
+        rows.append({"month": key, "repo": repo, **counts.get(key, dict.fromkeys(THROUGHPUT_COLUMNS, 0))})
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return rows
+
+
+@cli.command("throughput")
+@click.argument("repositories", nargs=-1, required=True)
+@_window_options
+@click.pass_context
+def throughput_command(ctx, repositories: tuple[str], since: datetime | None, until: datetime | None):
+    """Counts issues and pull requests opened, closed and merged per calendar month (UTC)."""
+    console.log(f"Command: 'throughput', Args: {repositories}")
+    window = _parse_window(since, until)
+    rows = []
+    incomplete_repos = []
+    for repo_full_name in repositories:
+        if "/" not in repo_full_name:
+            console.log(f"[red]Invalid repository format: '{repo_full_name}'. Must be 'owner/repo'.[/]")
+            continue
+
+        issues, issues_complete = fetch_issues(repo_full_name)
+        pulls, pulls_complete = fetch_pulls(repo_full_name)
+        if not (issues_complete and pulls_complete):
+            incomplete_repos.append(repo_full_name)
+        rows.extend(_throughput_rows(repo_full_name, issues, pulls, window))
+
+    if not rows:
+        console.log("[yellow]No issue or pull request activity found for any repository.[/]")
+        return
+
+    rows.sort(key=lambda row: (row["month"], row["repo"]))
+    base_output_name = repositories[0] if len(repositories) == 1 and "/" in repositories[0] else "all_repos"
+    output_file = f"{base_output_name.replace('/', '_')}_throughput.csv"
+    pd.DataFrame(rows, columns=["month", "repo", *THROUGHPUT_COLUMNS]).to_csv(output_file, index=False)
+    console.log(f"Saved {len(rows)} items to {output_file}")
+    _warn_incomplete(incomplete_repos, "issue/pull request")
+    _print_window("each event's own timestamp", window)
+
+    opened = sum(row["issues_opened"] for row in rows)
+    closed = sum(row["issues_closed"] for row in rows)
+    console.print("\nThroughput Summary:")
+    console.print(f"Net issue backlog change: {opened - closed:+d} ({opened} opened, {closed} closed)")
+    latest = max(row["month"] for row in rows)
+    console.print(f"Latest month ({latest}):")
+    for row in (r for r in rows if r["month"] == latest):
+        console.print(
+            f"{row['repo']}: {row['issues_opened']} issues opened, {row['issues_closed']} closed; "
+            f"{row['prs_opened']} PRs opened, {row['prs_merged']} merged, "
+            f"{row['prs_closed_unmerged']} closed unmerged"
+        )
+
+
 def _summarize_repo_portfolio(items: list) -> None:
     """Print portfolio totals, fork/archive counts, leading repositories, and languages."""
     console.print("\nRepository Overview:")
