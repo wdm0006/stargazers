@@ -1,10 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 - 2026-11-23
 
 ### Added
 
 - Add a `throughput` command that exports monthly opened/closed issue and opened/merged/closed-unmerged PR counts per repository, each counted by its own event timestamp.
+- Write a `<csv>.meta.json` provenance sidecar beside every CSV (command, version, collection time, repositories, window, row count, completeness). Pass `--no-metadata` to skip it; CSV contents are unchanged.
+- Add `--no-profiles` to `repos`, `forkers` and `contributors` to skip the per-user profile requests and export only list-payload fields.
 
 ## 0.4.0 - 2026-10-10
 
